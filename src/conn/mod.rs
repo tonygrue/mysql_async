@@ -6,31 +6,32 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use self::stmt_cache::StmtCache;
-use conn::pool::Pool;
-use connection_like::streamless::Streamless;
-use connection_like::{ConnectionLike, StmtCacheResult};
-use consts::{self, CapabilityFlags};
-use errors::*;
-use io::Stream;
-use lib_futures::future::{err, loop_fn, ok, Either::*, Future, IntoFuture, Loop};
-use local_infile_handler::LocalInfileHandler;
-use myc::{
-    crypto,
-    packets::{parse_handshake_packet, AuthPlugin, HandshakeResponse, SslRequest},
-    scramble,
-};
-use opts::Opts;
-use queryable::query_result;
-use queryable::{BinaryProtocol, Queryable, TextProtocol};
-use std::fmt;
-use std::mem;
-use std::sync::Arc;
-use time::SteadyTime;
-use Column;
-use MyFuture;
+pub use mysql_common::named_params;
 
-pub mod named_params;
+use futures::future::{err, loop_fn, ok, Either::*, Future, IntoFuture, Loop};
+use mysql_common::{
+    crypto,
+    packets::{
+        parse_auth_switch_request, parse_handshake_packet, AuthPlugin, AuthSwitchRequest,
+        HandshakeResponse, SslRequest,
+    },
+};
+
+use std::{fmt, mem, str::FromStr, sync::Arc};
+
+use crate::{
+    conn::{pool::Pool, stmt_cache::StmtCache},
+    connection_like::{streamless::Streamless, ConnectionLike, StmtCacheResult},
+    consts::{self, CapabilityFlags},
+    error::*,
+    io::Stream,
+    local_infile_handler::LocalInfileHandler,
+    opts::Opts,
+    queryable::{query_result, BinaryProtocol, Queryable, TextProtocol},
+    time::SteadyTime,
+    BoxFuture, Column, MyFuture,
+};
+
 pub mod pool;
 pub mod stmt_cache;
 
@@ -56,10 +57,11 @@ pub struct Conn {
     stmt_cache: StmtCache,
     nonce: Vec<u8>,
     auth_plugin: AuthPlugin<'static>,
+    auth_switched: bool,
 }
 
 impl fmt::Debug for Conn {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Conn")
             .field("connection id", &self.id)
             .field("server version", &self.version)
@@ -118,6 +120,7 @@ impl Conn {
                 stmt_cache: StmtCache::new(0),
                 nonce: Vec::default(),
                 auth_plugin: AuthPlugin::MysqlNativePassword,
+                auth_switched: false,
             },
         )
     }
@@ -144,6 +147,7 @@ impl Conn {
             opts: opts,
             nonce: Vec::default(),
             auth_plugin: AuthPlugin::MysqlNativePassword,
+            auth_switched: false,
         }
     }
 
@@ -161,7 +165,7 @@ impl Conn {
     fn handle_handshake(self) -> impl MyFuture<Conn> {
         self.read_packet().and_then(move |(mut conn, packet)| {
             parse_handshake_packet(&*packet.0)
-                .chain_err(|| "Invalid handshake from server")
+                .map_err(Error::from)
                 .and_then(|handshake| {
                     conn.nonce = {
                         let mut nonce = Vec::from(handshake.scramble_1_ref());
@@ -178,9 +182,9 @@ impl Conn {
                         Some(AuthPlugin::CachingSha2Password) => AuthPlugin::CachingSha2Password,
                         Some(AuthPlugin::Other(ref name)) => {
                             let name = String::from_utf8_lossy(name).into();
-                            return Err(ErrorKind::UnknownAuthPlugin(name).into());
+                            return Err(DriverError::UnknownAuthPlugin { name }.into());
                         }
-                        None => unreachable!(),
+                        None => AuthPlugin::MysqlNativePassword,
                     };
                     Ok(conn)
                 })
@@ -213,23 +217,12 @@ impl Conn {
     }
 
     fn do_handshake_response(self) -> impl MyFuture<Conn> {
-        let scramble = self
-            .opts
-            .get_pass()
-            .and_then(|pass| match self.auth_plugin {
-                AuthPlugin::MysqlNativePassword => {
-                    scramble::scramble_native(&*self.nonce, pass.as_bytes())
-                        .map(|x| Vec::from(&x[..]))
-                }
-                AuthPlugin::CachingSha2Password => {
-                    scramble::scramble_sha256(&*self.nonce, pass.as_bytes())
-                        .map(|x| Vec::from(&x[..]))
-                }
-                _ => unreachable!(),
-            });
+        let auth_data = self
+            .auth_plugin
+            .gen_data(self.opts.get_pass(), &*self.nonce);
 
         let handshake_response = HandshakeResponse::new(
-            &scramble,
+            &auth_data,
             self.version,
             self.opts.get_user().as_ref().map(|x| x.as_ref()),
             self.opts.get_db_name().as_ref().map(|x| x.as_ref()),
@@ -240,48 +233,103 @@ impl Conn {
         self.write_packet(handshake_response.as_ref())
     }
 
-    fn perform_auth(self) -> impl MyFuture<Conn> {
+    fn perform_auth_switch(
+        mut self,
+        auth_switch_request: AuthSwitchRequest<'_>,
+    ) -> BoxFuture<Conn> {
+        if !self.auth_switched {
+            self.auth_switched = true;
+            self.nonce = auth_switch_request.plugin_data().into();
+            self.auth_plugin = auth_switch_request.auth_plugin().clone().into_owned();
+            let plugin_data = self
+                .auth_plugin
+                .gen_data(self.opts.get_pass(), &*self.nonce)
+                .unwrap_or_else(Vec::new);
+            let fut = self.write_packet(plugin_data).and_then(Conn::continue_auth);
+            // We'll box it to avoid recursion.
+            Box::new(fut)
+        } else {
+            unreachable!("auth_switched flag should be checked by caller")
+        }
+    }
+
+    fn continue_auth(self) -> impl MyFuture<Conn> {
         match self.auth_plugin {
-            AuthPlugin::MysqlNativePassword => A(self.perform_mysql_native_password_auth()),
-            AuthPlugin::CachingSha2Password => B(self.perform_caching_sha2_password_auth()),
+            AuthPlugin::MysqlNativePassword => A(self.continue_mysql_native_password_auth()),
+            AuthPlugin::CachingSha2Password => B(self.continue_caching_sha2_password_auth()),
             _ => unreachable!(),
         }
     }
 
-    fn perform_caching_sha2_password_auth(self) -> impl MyFuture<Conn> {
-        let mut pass = self.opts.get_pass().map(Vec::from).unwrap_or(vec![]);
-        pass.push(0);
-
+    fn continue_caching_sha2_password_auth(self) -> impl MyFuture<Conn> {
         self.read_packet()
-            .and_then(move |(conn, packet)| match packet.as_ref()[0] {
-                0xfe => A(err(ErrorKind::AuthSwitch.into())),
-                0x01 => match packet.as_ref()[1] {
-                    0x03 => A(ok(conn)),
-                    0x04 => if conn.is_secure() {
-                        B(A(conn.write_packet(&*pass)))
-                    } else {
-                        let fut = conn
-                            .write_packet(&[0x02][..])
-                            .and_then(|conn| conn.read_packet())
-                            .and_then(move |(conn, packet)| {
-                                let key = &packet.as_ref()[1..];
-                                for i in 0..pass.len() {
-                                    pass[i] ^= conn.nonce[i % conn.nonce.len()];
-                                }
-                                let encrypted_pass = crypto::encrypt(&*pass, key);
-                                conn.write_packet(&*encrypted_pass)
-                            });
-                        B(B(fut))
-                    },
-                    _ => unreachable!(),
+            .and_then(|(conn, packet)| match packet.as_ref().get(0) {
+                Some(0x01) => match packet.as_ref().get(1) {
+                    Some(0x03) => {
+                        // auth ok
+                        A(conn.drop_packet())
+                    }
+                    Some(0x04) => {
+                        let mut pass = conn.opts.get_pass().map(Vec::from).unwrap_or(vec![]);
+                        pass.push(0);
+                        let fut = if conn.is_secure() {
+                            A(conn.write_packet(&*pass))
+                        } else {
+                            B(conn
+                                .write_packet(&[0x02][..])
+                                .and_then(Conn::read_packet)
+                                .and_then(move |(conn, packet)| {
+                                    let key = &packet.as_ref()[1..];
+                                    for i in 0..pass.len() {
+                                        pass[i] ^= conn.nonce[i % conn.nonce.len()];
+                                    }
+                                    let encrypted_pass = crypto::encrypt(&*pass, key);
+                                    conn.write_packet(&*encrypted_pass)
+                                }))
+                        };
+                        B(A(fut.and_then(Conn::drop_packet)))
+                    }
+                    _ => B(B(A(err(DriverError::UnexpectedPacket {
+                        payload: packet.as_ref().into(),
+                    }
+                    .into())))),
                 },
-                _ => unreachable!(),
+                Some(0xfe) if !conn.auth_switched => {
+                    let fut = parse_auth_switch_request(packet.as_ref())
+                        .map(AuthSwitchRequest::into_owned)
+                        .map_err(Error::from)
+                        .into_future()
+                        .and_then(|auth_switch_request| {
+                            conn.perform_auth_switch(auth_switch_request)
+                        });
+                    B(B(B(A(fut))))
+                }
+                _ => B(B(B(B(err(DriverError::UnexpectedPacket {
+                    payload: packet.as_ref().into(),
+                }
+                .into()))))),
             })
     }
 
-    fn perform_mysql_native_password_auth(self) -> impl MyFuture<Conn> {
-        // there is nothing to do after handshake response
-        ok(self)
+    fn continue_mysql_native_password_auth(self) -> impl MyFuture<Conn> {
+        self.read_packet()
+            .and_then(|(this, packet)| match packet.0.get(0) {
+                Some(0x00) => A(ok(this)),
+                Some(0xfe) if !this.auth_switched => {
+                    let fut = parse_auth_switch_request(packet.as_ref())
+                        .map(AuthSwitchRequest::into_owned)
+                        .map_err(Error::from)
+                        .into_future()
+                        .and_then(|auth_switch_request| {
+                            this.perform_auth_switch(auth_switch_request)
+                        });
+                    B(A(fut))
+                }
+                _ => B(B(err(DriverError::UnexpectedPacket {
+                    payload: packet.0.into(),
+                }
+                .into()))),
+            })
     }
 
     fn drop_packet(self) -> impl MyFuture<Conn> {
@@ -305,6 +353,7 @@ impl Conn {
         )
     }
 
+    /// Returns future that resolves to `Conn`.
     pub fn new<T: Into<Opts>>(opts: T) -> impl MyFuture<Conn> {
         let mut conn = Conn::empty(opts.into());
 
@@ -317,11 +366,18 @@ impl Conn {
             .and_then(Conn::handle_handshake)
             .and_then(Conn::switch_to_ssl_if_needed)
             .and_then(Conn::do_handshake_response)
-            .and_then(Conn::perform_auth)
-            .and_then(Conn::drop_packet)
+            .and_then(Conn::continue_auth)
             .and_then(Conn::read_max_allowed_packet)
             .and_then(Conn::read_wait_timeout)
             .and_then(Conn::run_init_commands)
+    }
+
+    /// Returns future that resolves to `Conn`.
+    pub fn from_url<T: AsRef<str>>(url: T) -> impl MyFuture<Conn> {
+        Opts::from_str(url.as_ref())
+            .map_err(Error::from)
+            .into_future()
+            .and_then(Conn::new)
     }
 
     /// Returns future that resolves to `Conn` with `max_allowed_packet` stored in it.
@@ -380,12 +436,14 @@ impl Conn {
                 self,
                 Some(columns),
                 None,
-            ).drop_result())),
+            )
+            .drop_result())),
             Some((columns, cached)) => A(A(query_result::assemble::<_, BinaryProtocol>(
                 self,
                 Some(columns),
                 cached,
-            ).drop_result())),
+            )
+            .drop_result())),
             None => B(ok(self)),
         }
     }
@@ -432,7 +490,7 @@ impl ConnectionLike for Conn {
         self.last_command
     }
 
-    fn get_local_infile_handler(&self) -> Option<Arc<LocalInfileHandler>> {
+    fn get_local_infile_handler(&self) -> Option<Arc<dyn LocalInfileHandler>> {
         self.opts.get_local_infile_handler()
     }
 
@@ -503,17 +561,14 @@ impl ConnectionLike for Conn {
 
 #[cfg(test)]
 mod test {
-    use from_row;
-    use lib_futures::Future;
-    use prelude::*;
-    use test_misc::DATABASE_URL;
-    use tokio;
-    use Conn;
-    use OptsBuilder;
+    use futures::Future;
+
     #[cfg(feature = "ssl")]
-    use SslOpts;
-    use TransactionOptions;
-    use WhiteListFsLocalInfileHandler;
+    use crate::SslOpts;
+    use crate::{
+        from_row, params, prelude::*, test_misc::DATABASE_URL, Conn, OptsBuilder,
+        TransactionOptions, WhiteListFsLocalInfileHandler,
+    };
 
     /// Same as `tokio::run`, but will panic if future panics and will return the result
     /// of future execution.
@@ -536,7 +591,9 @@ mod test {
         #[cfg(feature = "ssl")]
         {
             let mut ssl_opts = SslOpts::new();
-            ssl_opts.set_pkcs12_path(Some(AsRef::<::std::path::Path>::as_ref("./test/client.p12")));
+            ssl_opts.set_pkcs12_path(Some(AsRef::<::std::path::Path>::as_ref(
+                "./test/client.p12",
+            )));
             ssl_opts.set_root_cert_path(Some(AsRef::<::std::path::Path>::as_ref(
                 "./test/ca-cert.der",
             )));
@@ -594,8 +651,8 @@ mod test {
             .and_then(|conn| conn.drop_exec("DO ?", (1,)))
             .and_then(|conn| {
                 conn.prepare("DO 2").and_then(|stmt| {
-                    stmt.first::<_, (::Value,)>(())
-                        .and_then(|(stmt, _)| stmt.first::<_, (::Value,)>(()))
+                    stmt.first::<_, (crate::Value,)>(())
+                        .and_then(|(stmt, _)| stmt.first::<_, (crate::Value,)>(()))
                         .and_then(|(stmt, _)| stmt.close())
                 })
             })
@@ -616,7 +673,7 @@ mod test {
 
     #[test]
     fn should_hold_stmt_cache_size_bound() {
-        use connection_like::ConnectionLike;
+        use crate::connection_like::ConnectionLike;
 
         let mut opts = OptsBuilder::from_opts(get_opts());
         opts.stmt_cache_size(3);
@@ -669,9 +726,7 @@ mod test {
                     acc
                 })
             })
-            .and_then(move |(conn, out)| {
-                Queryable::disconnect(conn).map(|_| out)
-            })
+            .and_then(move |(conn, out)| Queryable::disconnect(conn).map(|_| out))
             .map(move |result| {
                 assert_eq!((String::from("hello"), 123), result[0]);
                 assert_eq!((long_string, 231), result[1]);
@@ -1091,8 +1146,8 @@ mod test {
                 x
             })
             .then(|result| match result {
-                Err(err) => match err.kind() {
-                    ::errors::ErrorKind::Server(_, 1148, _) => {
+                Err(err) => match err {
+                    crate::error::Error::Server(ref err) if err.code == 1148 => {
                         // The used command is not allowed with this MySQL version
                         Ok(())
                     }
@@ -1106,12 +1161,10 @@ mod test {
 
     #[cfg(feature = "nightly")]
     mod bench {
+        use futures::Future;
+
         use super::get_opts;
-        use conn::Conn;
-        use lib_futures::Future;
-        use queryable::Queryable;
-        use test;
-        use tokio;
+        use crate::{conn::Conn, queryable::Queryable};
 
         #[bench]
         fn simple_exec(bencher: &mut test::Bencher) {

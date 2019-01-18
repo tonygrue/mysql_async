@@ -6,33 +6,35 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use self::read_packet::ReadPacket;
-use self::streamless::Streamless;
-use self::write_packet::WritePacket;
 use byteorder::{ByteOrder, LittleEndian};
-use conn::named_params::parse_named_params;
-use conn::stmt_cache::StmtCache;
-use consts::{CapabilityFlags, Command, StatusFlags};
-use errors::*;
-use io;
-use lib_futures::future::Either::*;
-use lib_futures::future::{err, loop_fn, ok, Future, IntoFuture, Loop};
-use local_infile_handler::LocalInfileHandler;
-use myc::io::ReadMysqlExt;
-use myc::packets::{column_from_payload, parse_local_infile_packet, Column, RawPacket};
-use queryable::query_result::{self, QueryResult};
-use queryable::stmt::InnerStmt;
-use queryable::Protocol;
-use std::sync::Arc;
+use futures::future::{err, loop_fn, ok, Either::*, Future, IntoFuture, Loop};
+use mysql_common::{
+    io::ReadMysqlExt,
+    packets::{column_from_payload, parse_local_infile_packet, Column, RawPacket},
+};
 use tokio_io::io::read;
-use BoxFuture;
-use MyFuture;
-use Opts;
+
+use std::sync::Arc;
+
+use crate::{
+    conn::{named_params::parse_named_params, stmt_cache::StmtCache},
+    connection_like::{read_packet::ReadPacket, streamless::Streamless, write_packet::WritePacket},
+    consts::{CapabilityFlags, Command, StatusFlags},
+    error::*,
+    io,
+    local_infile_handler::LocalInfileHandler,
+    queryable::{
+        query_result::{self, QueryResult},
+        stmt::InnerStmt,
+        Protocol,
+    },
+    BoxFuture, MyFuture, Opts,
+};
 
 pub mod read_packet;
 pub mod streamless {
     use super::ConnectionLike;
-    use io::Stream;
+    use crate::io::Stream;
 
     pub struct Streamless<T>(T);
 
@@ -112,7 +114,7 @@ where
         self.conn_like_ref().get_last_insert_id()
     }
 
-    fn get_local_infile_handler(&self) -> Option<Arc<LocalInfileHandler>> {
+    fn get_local_infile_handler(&self) -> Option<Arc<dyn LocalInfileHandler>> {
         self.conn_like_ref().get_local_infile_handler()
     }
 
@@ -193,7 +195,7 @@ pub trait ConnectionLike: Send {
     fn get_in_transaction(&self) -> bool;
     fn get_last_command(&self) -> Command;
     fn get_last_insert_id(&self) -> Option<u64>;
-    fn get_local_infile_handler(&self) -> Option<Arc<LocalInfileHandler>>;
+    fn get_local_infile_handler(&self) -> Option<Arc<dyn LocalInfileHandler>>;
     fn get_max_allowed_packet(&self) -> u64;
     fn get_opts(&self) -> &Opts;
     fn get_pending_result(&self) -> Option<&(Arc<Vec<Column>>, Option<StmtCacheResult>)>;
@@ -369,7 +371,7 @@ pub trait ConnectionLike: Send {
                     Box::new(fut)
                 }
             }
-            Err(err) => Box::new(Err(err).into_future()),
+            Err(err) => Box::new(Err(Error::from(err)).into_future()),
         }
     }
 
@@ -434,10 +436,10 @@ where
     T: Send + Sized + 'static,
 {
     parse_local_infile_packet(&*packet.0)
-        .chain_err(|| Error::from(ErrorKind::UnexpectedPacket))
+        .map_err(Error::from)
         .and_then(|local_infile| match this.get_local_infile_handler() {
             Some(handler) => Ok((local_infile.into_owned(), handler)),
-            None => Err(ErrorKind::NoLocalInfileHandler.into()),
+            None => Err(DriverError::NoLocalInfileHandler.into()),
         })
         .into_future()
         .and_then(|(local_infile, handler)| handler.handle(local_infile.file_name_ref()))
@@ -463,8 +465,9 @@ where
                             Loop::Break(this)
                         }
                     })
-            }).and_then(|this| this.read_packet())
-                .map(|(this, _)| query_result::new(this, None, cached))
+            })
+            .and_then(|this| this.read_packet())
+            .map(|(this, _)| query_result::new(this, None, cached))
         })
 }
 

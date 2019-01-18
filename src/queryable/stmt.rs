@@ -7,26 +7,28 @@
 // modified, or distributed except according to those terms.
 
 use bit_vec::BitVec;
-use byteorder::LittleEndian as LE;
-use byteorder::{ReadBytesExt, WriteBytesExt};
-use connection_like::streamless::Streamless;
-use connection_like::{ConnectionLike, ConnectionLikeWrapper, StmtCacheResult};
-use consts::{ColumnType, Command};
-use errors::*;
-use io;
-use lib_futures::future::Either::*;
-use lib_futures::future::{err, loop_fn, ok, Either, Future, IntoFuture, Loop};
-use myc::value::serialize_bin_many;
-use prelude::FromRow;
-use queryable::query_result::QueryResult;
-use queryable::BinaryProtocol;
+use byteorder::{LittleEndian as LE, ReadBytesExt, WriteBytesExt};
+use futures::future::{
+    err, loop_fn, ok,
+    Either::{self, *},
+    Future, IntoFuture, Loop,
+};
+use mysql_common::value::serialize_bin_many;
+
 use std::io::Write;
-use Column;
-use MyFuture;
-use Params;
-use Row;
-use Value;
-use Value::*;
+
+use crate::{
+    connection_like::{
+        streamless::Streamless, ConnectionLike, ConnectionLikeWrapper, StmtCacheResult,
+    },
+    consts::{ColumnType, Command},
+    error::*,
+    io,
+    prelude::FromRow,
+    queryable::{query_result::QueryResult, BinaryProtocol},
+    Column, MyFuture, Params, Row,
+    Value::{self, *},
+};
 
 /// Inner statement representation.
 #[derive(Eq, PartialEq, Clone, Debug)]
@@ -96,7 +98,7 @@ where
         index: usize,
     ) -> impl MyFuture<(Self, Vec<Value>)> {
         loop_fn((self, params, index, 0), |(this, params, index, chunk)| {
-            let data_cap = ::consts::MAX_PAYLOAD_LEN - 10;
+            let data_cap = crate::consts::MAX_PAYLOAD_LEN - 10;
             let buf = match params[index] {
                 Bytes(ref x) => {
                     let statement_id = this.inner.statement_id;
@@ -159,8 +161,11 @@ where
         U: Send + 'static,
     {
         if self.inner.num_params as usize != params.len() {
-            let error =
-                ErrorKind::MismatchedStmtParams(self.inner.num_params, params.len() as u16).into();
+            let error = DriverError::StmtParamsMismatch {
+                required: self.inner.num_params,
+                supplied: params.len() as u16,
+            }
+            .into();
             return A(err(error));
         }
 
@@ -193,7 +198,7 @@ where
 
     fn execute_named(self, params: Params) -> impl MyFuture<QueryResult<Self, BinaryProtocol>> {
         if self.inner.named_params.is_none() {
-            let error = ErrorKind::NamedParamsForPositionalQuery.into();
+            let error = DriverError::NamedParamsForPositionalQuery.into();
             return A(err(error));
         }
 
@@ -213,7 +218,11 @@ where
 
     fn execute_empty(self) -> impl MyFuture<QueryResult<Self, BinaryProtocol>> {
         if self.inner.num_params > 0 {
-            let error = ErrorKind::MismatchedStmtParams(self.inner.num_params, 0).into();
+            let error = DriverError::StmtParamsMismatch {
+                required: self.inner.num_params,
+                supplied: 0,
+            }
+            .into();
             return A(err(error));
         }
 

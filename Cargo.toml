@@ -7,18 +7,20 @@ license = "MIT/Apache-2.0"
 name = "mysql_async"
 readme = "README.md"
 repository = "https://github.com/blackbeam/mysql_async"
-version = "0.16.0"
+version = "0.17.1"
 exclude = ["test/*"]
+edition = "2018"
 
 [dependencies]
 bit-vec = "0.5"
 byteorder = "1"
 bytes = "0.4"
-error-chain = "0.12"
+failure = "0.1"
+failure_derive = "0.1"
 fnv = "1"
 futures = "0.1"
 mio = "0.6"
-# mysql_common = "0.14"
+# mysql_common = "0.15"
 mysql_common = { git = "https://github.com/tonygrue/rust_mysql_common.git" }
 native-tls = { version = "0.2", optional = true }
 regex = "1"

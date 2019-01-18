@@ -124,115 +124,27 @@
 #[cfg(feature = "nightly")]
 extern crate test;
 
-extern crate bit_vec;
-extern crate byteorder;
-extern crate bytes;
-#[macro_use]
-extern crate error_chain;
-extern crate fnv;
-#[macro_use]
-extern crate futures as lib_futures;
-#[cfg(test)]
-#[macro_use]
-extern crate lazy_static;
-extern crate mio;
-extern crate mysql_common as myc;
-#[cfg(feature = "ssl")]
-extern crate native_tls;
-extern crate regex;
-extern crate serde;
-extern crate serde_json;
-extern crate tokio;
-extern crate tokio_codec;
-extern crate tokio_io;
-extern crate twox_hash;
-extern crate url;
-
-pub use myc::chrono;
-pub use myc::constants as consts;
-pub use myc::time;
-pub use myc::uuid;
-
-// Until `macro_reexport` stabilisation.
-/// This macro is a convenient way to pass named parameters to a statement.
-///
-/// ```ignore
-/// let foo = 42;
-/// conn.prep_exec("SELECT :foo, :foo2x", params! {
-///     foo,
-///     "foo2x" => foo * 2,
-/// });
-/// ```
-#[macro_export]
-macro_rules! params {
-    () => {};
-    (@to_pair $name:expr => $value:expr) => (
-        (::std::string::String::from($name), $crate::Value::from($value))
-    );
-    (@to_pair $name:ident) => (
-        (::std::string::String::from(stringify!($name)), $crate::Value::from($name))
-    );
-    (@expand $vec:expr;) => {};
-    (@expand $vec:expr; $name:expr => $value:expr, $($tail:tt)*) => {
-        $vec.push(params!(@to_pair $name => $value));
-        params!(@expand $vec; $($tail)*);
-    };
-    (@expand $vec:expr; $name:expr => $value:expr $(, $tail:tt)*) => {
-        $vec.push(params!(@to_pair $name => $value));
-        params!(@expand $vec; $($tail)*);
-    };
-    (@expand $vec:expr; $name:ident, $($tail:tt)*) => {
-        $vec.push(params!(@to_pair $name));
-        params!(@expand $vec; $($tail)*);
-    };
-    (@expand $vec:expr; $name:ident $(, $tail:tt)*) => {
-        $vec.push(params!(@to_pair $name));
-        params!(@expand $vec; $($tail)*);
-    };
-    ($i:ident, $($tail:tt)*) => {
-        {
-            let mut output = ::std::vec::Vec::new();
-            params!(@expand output; $i, $($tail)*);
-            output
-        }
-    };
-    ($i:expr => $($tail:tt)*) => {
-        {
-            let mut output = ::std::vec::Vec::new();
-            params!(@expand output; $i => $($tail)*);
-            output
-        }
-    };
-    ($i:ident) => {
-        {
-            let mut output = ::std::vec::Vec::new();
-            params!(@expand output; $i);
-            output
-        }
-    }
-}
+pub use mysql_common::{chrono, constants as consts, params, time, uuid};
 
 #[macro_use]
-pub mod macros;
+mod macros;
 mod conn;
 mod connection_like;
 /// Errors used in this crate
-pub mod errors;
+pub mod error;
 mod io;
 mod local_infile_handler;
 mod opts;
 mod queryable;
 
-pub type BoxFuture<T> = Box<lib_futures::Future<Item = T, Error = errors::Error> + Send + 'static>;
+pub type BoxFuture<T> = Box<dyn ::futures::Future<Item = T, Error = error::Error> + Send + 'static>;
 
 /// Alias for `Future` with library error as `Future::Error`.
-pub trait MyFuture<T>:
-    lib_futures::Future<Item = T, Error = errors::Error> + Send + 'static
+pub trait MyFuture<T>: ::futures::Future<Item = T, Error = error::Error> + Send + 'static {}
+impl<T, U> MyFuture<T> for U where
+    U: ::futures::Future<Item = T, Error = error::Error> + Send + 'static
 {
 }
-impl<T, U> MyFuture<T> for U where
-    U: lib_futures::Future<Item = T, Error = errors::Error> + Send + 'static
-{}
 
 #[doc(inline)]
 pub use self::conn::Conn;
@@ -244,31 +156,31 @@ pub use self::conn::pool::Pool;
 pub use self::queryable::transaction::IsolationLevel;
 
 #[doc(inline)]
-pub use self::opts::{Opts, OptsBuilder, SslOpts};
+pub use self::opts::{Opts, OptsBuilder, PoolConstraints, SslOpts};
 
 #[doc(inline)]
 pub use self::local_infile_handler::builtin::WhiteListFsLocalInfileHandler;
 
 #[doc(inline)]
-pub use myc::packets::Column;
+pub use mysql_common::packets::Column;
 
 #[doc(inline)]
-pub use myc::row::Row;
+pub use mysql_common::row::Row;
 
 #[doc(inline)]
-pub use myc::params::Params;
+pub use mysql_common::params::Params;
 
 #[doc(inline)]
-pub use myc::value::Value;
+pub use mysql_common::value::Value;
 
 #[doc(inline)]
-pub use myc::row::convert::{from_row, from_row_opt, FromRowError};
+pub use mysql_common::row::convert::{from_row, from_row_opt, FromRowError};
 
 #[doc(inline)]
-pub use myc::value::convert::{from_value, from_value_opt, FromValueError};
+pub use mysql_common::value::convert::{from_value, from_value_opt, FromValueError};
 
 #[doc(inline)]
-pub use myc::value::json::{Deserialized, Serialized};
+pub use mysql_common::value::json::{Deserialized, Serialized};
 
 #[doc(inline)]
 pub use self::queryable::query_result::QueryResult;
@@ -284,7 +196,7 @@ pub use self::queryable::stmt::Stmt;
 
 /// Futures used in this crate
 pub mod futures {
-    pub use queryable::query_result::{
+    pub use crate::queryable::query_result::{
         ForEach, ForEachAndDrop, Map, MapAndDrop, Reduce, ReduceAndDrop,
     };
 }
@@ -292,19 +204,29 @@ pub mod futures {
 /// Traits used in this crate
 pub mod prelude {
     #[doc(inline)]
-    pub use local_infile_handler::LocalInfileHandler;
+    pub use crate::local_infile_handler::LocalInfileHandler;
     #[doc(inline)]
-    pub use myc::row::convert::FromRow;
+    pub use crate::queryable::Queryable;
     #[doc(inline)]
-    pub use myc::value::convert::{ConvIr, FromValue, ToValue};
+    pub use mysql_common::row::convert::FromRow;
     #[doc(inline)]
-    pub use queryable::Queryable;
+    pub use mysql_common::value::convert::{ConvIr, FromValue, ToValue};
 }
 
 #[cfg(test)]
 mod test_misc {
-    use opts;
+    use lazy_static::lazy_static;
+
     use std::env;
+
+    use crate::opts;
+
+    #[allow(dead_code)]
+    fn error_should_implement_send_and_sync() {
+        fn _dummy<T: Send + Sync>(_: T) {}
+        _dummy(crate::error::Error::from("foo"));
+    }
+
     lazy_static! {
         pub static ref DATABASE_URL: String = {
             if let Ok(url) = env::var("DATABASE_URL") {

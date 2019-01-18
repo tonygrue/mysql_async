@@ -6,12 +6,12 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use conn::pool::Pool;
-use errors::*;
-use lib_futures::Async::NotReady;
-use lib_futures::Async::Ready;
-use lib_futures::Future;
-use lib_futures::Poll;
+use futures::{
+    Async::{NotReady, Ready},
+    Future, Poll,
+};
+
+use crate::{conn::pool::Pool, error::*};
 
 /// Future that disconnects this pool from server and resolves to `()`.
 ///

@@ -6,15 +6,10 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use consts::MAX_PAYLOAD_LEN;
-use errors::*;
-use io::Stream;
-use lib_futures::Async;
-use lib_futures::AsyncSink;
-use lib_futures::Future;
-use lib_futures::Poll;
-use lib_futures::Sink;
-use myc::packets::RawPacket;
+use futures::{try_ready, Async, AsyncSink, Future, Poll, Sink};
+use mysql_common::packets::RawPacket;
+
+use crate::{consts::MAX_PAYLOAD_LEN, error::*, io::Stream};
 
 /// Future that writes packet to a `Stream` and resolves to a pair of `Stream` and MySql's sequence
 /// id.
@@ -30,8 +25,8 @@ pub fn new(stream: Stream, data: Vec<u8>, seq_id: u8) -> WritePacket {
     let resulting_seq_id = seq_id.wrapping_add(1);
 
     // each new packet after 2²⁴−1 will add to the resulting sequence id
-    let mut resulting_seq_id = resulting_seq_id
-        .wrapping_add(((data.len() / MAX_PAYLOAD_LEN) % 256) as u8);
+    let mut resulting_seq_id =
+        resulting_seq_id.wrapping_add(((data.len() / MAX_PAYLOAD_LEN) % 256) as u8);
 
     // empty tail packet will also add to the resulting sequence id
     if data.len() > 0 && data.len() % MAX_PAYLOAD_LEN == 0 {
@@ -70,16 +65,18 @@ impl Future for WritePacket {
             None => (),
         }
 
-        try_ready!(
-            self.stream
-                .as_mut()
-                .unwrap()
-                .codec
-                .as_mut()
-                .unwrap()
-                .poll_complete()
-                .map_err(Error::from)
-        );
-        Ok(Async::Ready((self.stream.take().unwrap(), self.resulting_seq_id)))
+        try_ready!(self
+            .stream
+            .as_mut()
+            .unwrap()
+            .codec
+            .as_mut()
+            .unwrap()
+            .poll_complete()
+            .map_err(Error::from));
+        Ok(Async::Ready((
+            self.stream.take().unwrap(),
+            self.resulting_seq_id,
+        )))
     }
 }

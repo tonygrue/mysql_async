@@ -6,20 +6,22 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use errors::*;
-use io::{packet_codec::PacketCodec, Stream};
-use lib_futures::failed;
-use lib_futures::future::select_ok;
-use lib_futures::future::SelectOk;
-use lib_futures::Async;
-use lib_futures::Async::Ready;
-use lib_futures::Failed;
-use lib_futures::Future;
-use lib_futures::Poll;
-use std::io;
-use std::net::ToSocketAddrs;
+use futures::{
+    failed,
+    future::{select_ok, SelectOk},
+    try_ready,
+    Async::{self, Ready},
+    Failed, Future, Poll,
+};
 use tokio::net::{tcp::ConnectFuture, TcpStream};
 use tokio_codec::Framed;
+
+use std::{io, net::ToSocketAddrs};
+
+use crate::{
+    error::*,
+    io::{packet_codec::PacketCodec, Stream},
+};
 
 steps! {
     ConnectingStream {

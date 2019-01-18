@@ -6,11 +6,12 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use conn::pool::Pool;
-use conn::Conn;
-use errors::*;
-use lib_futures::Future;
-use lib_futures::Poll;
+use futures::{Future, Poll};
+
+use crate::{
+    conn::{pool::Pool, Conn},
+    error::*,
+};
 
 /// This future will take connection from a pool and resolve to `Conn`.
 pub struct GetConn {

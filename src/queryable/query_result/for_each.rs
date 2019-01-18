@@ -6,14 +6,14 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use super::QueryResult;
-use connection_like::ConnectionLike;
-use errors::*;
-use lib_futures::Async::Ready;
-use lib_futures::{Future, Poll};
-use queryable::Protocol;
-use BoxFuture;
-use Row;
+use futures::{try_ready, Async::Ready, Future, Poll};
+
+use crate::{
+    connection_like::ConnectionLike,
+    error::*,
+    queryable::{query_result::QueryResult, Protocol},
+    BoxFuture, Row,
+};
 
 pub struct ForEach<T, P, F> {
     fut: BoxFuture<(QueryResult<T, P>, Option<Row>)>,

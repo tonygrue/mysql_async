@@ -6,10 +6,11 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::fmt;
-use std::sync::Arc;
 use tokio_io::AsyncRead;
-use BoxFuture;
+
+use std::{fmt, sync::Arc};
+
+use crate::BoxFuture;
 
 pub mod builtin;
 
@@ -44,7 +45,7 @@ pub mod builtin;
 /// struct ExampleHandler(&'static [u8]);
 ///
 /// impl LocalInfileHandler for ExampleHandler {
-///     fn handle(&self, _: &[u8]) -> Box<Future<Item=Box<AsyncRead + Send>, Error=my::errors::Error> + Send> {
+///     fn handle(&self, _: &[u8]) -> Box<Future<Item=Box<AsyncRead + Send>, Error=my::error::Error> + Send> {
 ///         Box::new(futures::future::ok(Box::new(self.0) as Box<_>))
 ///     }
 /// }
@@ -74,8 +75,8 @@ pub mod builtin;
 ///         assert_eq!(result[0], "foobar");
 ///     })
 ///     .and_then(|_| pool.disconnect())
-///     .map_err(|err| match err.kind() {
-///         my::errors::ErrorKind::Server(_, 1148, _) => {
+///     .map_err(|err| match err {
+///         my::error::Error::Server(ref err) if err.code == 1148 => {
 ///             // The used command is not allowed with this MySQL version
 ///         },
 ///         _ => panic!("{}", err),
@@ -87,34 +88,34 @@ pub mod builtin;
 pub trait LocalInfileHandler: Sync + Send {
     /// `file_name` is the file name in `LOAD DATA LOCAL INFILE '<file name>' INTO TABLE ...;`
     /// query.
-    fn handle(&self, file_name: &[u8]) -> BoxFuture<Box<AsyncRead + Send + 'static>>;
+    fn handle(&self, file_name: &[u8]) -> BoxFuture<Box<dyn AsyncRead + Send + 'static>>;
 }
 
 /// Object used to wrap `T: LocalInfileHandler` inside of Opts.
 #[derive(Clone)]
-pub struct LocalInfileHandlerObject(Arc<LocalInfileHandler>);
+pub struct LocalInfileHandlerObject(Arc<dyn LocalInfileHandler>);
 
 impl LocalInfileHandlerObject {
     pub fn new<T: LocalInfileHandler + 'static>(handler: T) -> Self {
         LocalInfileHandlerObject(Arc::new(handler))
     }
 
-    pub fn clone_inner(&self) -> Arc<LocalInfileHandler> {
+    pub fn clone_inner(&self) -> Arc<dyn LocalInfileHandler> {
         self.0.clone()
     }
 }
 
 impl PartialEq for LocalInfileHandlerObject {
     fn eq(&self, other: &LocalInfileHandlerObject) -> bool {
-        self.0.as_ref() as *const LocalInfileHandler
-            == other.0.as_ref() as *const LocalInfileHandler
+        self.0.as_ref() as *const dyn LocalInfileHandler
+            == other.0.as_ref() as *const dyn LocalInfileHandler
     }
 }
 
 impl Eq for LocalInfileHandlerObject {}
 
 impl fmt::Debug for LocalInfileHandlerObject {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Local infile handler object")
     }
 }

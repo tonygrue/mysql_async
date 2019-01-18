@@ -6,23 +6,24 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use self::query_result::QueryResult;
-use self::stmt::Stmt;
-use self::transaction::{Transaction, TransactionOptions};
-use connection_like::ConnectionLike;
-use consts::Command;
-use errors::*;
-use lib_futures::future::Future;
-use myc::packets::{parse_ok_packet, RawPacket};
-use myc::row::new_row;
-use myc::value::{read_bin_values, read_text_values};
-use prelude::FromRow;
+use futures::future::Future;
+use mysql_common::{
+    packets::{parse_ok_packet, RawPacket},
+    row::new_row,
+    value::{read_bin_values, read_text_values},
+};
+
 use std::sync::Arc;
-use BoxFuture;
-use Column;
-use Conn;
-use Params;
-use Row;
+
+use self::{
+    query_result::QueryResult,
+    stmt::Stmt,
+    transaction::{Transaction, TransactionOptions},
+};
+use crate::{
+    connection_like::ConnectionLike, consts::Command, error::*, prelude::FromRow, BoxFuture,
+    Column, Conn, Params, Row,
+};
 
 pub mod query_result;
 pub mod stmt;

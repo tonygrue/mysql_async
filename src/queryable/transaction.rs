@@ -6,15 +6,21 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use connection_like::streamless::Streamless;
-use connection_like::{ConnectionLike, ConnectionLikeWrapper};
-use errors::*;
-use io;
-use lib_futures::future::Either::*;
-use lib_futures::future::{err, ok, Either, Future, IntoFuture};
-use queryable::Queryable;
+use futures::future::{
+    err, ok,
+    Either::{self, *},
+    Future, IntoFuture,
+};
+
 use std::fmt;
-use MyFuture;
+
+use crate::{
+    connection_like::{streamless::Streamless, ConnectionLike, ConnectionLikeWrapper},
+    error::*,
+    io,
+    queryable::Queryable,
+    MyFuture,
+};
 
 /// Options for transaction
 #[derive(Eq, PartialEq, Debug, Hash, Clone, Default)]
@@ -73,7 +79,7 @@ pub enum IsolationLevel {
 }
 
 impl fmt::Display for IsolationLevel {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             IsolationLevel::ReadUncommitted => write!(f, "READ UNCOMMITTED"),
             IsolationLevel::ReadCommitted => write!(f, "READ COMMITTED"),
@@ -106,11 +112,11 @@ impl<T: Queryable + ConnectionLike> Transaction<T> {
         } = options;
 
         if conn_like.get_in_transaction() {
-            return A(err(ErrorKind::NestedTransaction.into()));
+            return A(err(DriverError::NestedTransaction.into()));
         }
 
         if readonly.is_some() && conn_like.get_server_version() < (5, 6, 5) {
-            return A(err(ErrorKind::ReadOnlyTransNotSupported.into()));
+            return A(err(DriverError::ReadOnlyTransNotSupported.into()));
         }
 
         let fut = if let Some(isolation_level) = isolation_level {

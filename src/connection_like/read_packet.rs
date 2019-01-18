@@ -6,14 +6,19 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use connection_like::streamless::Streamless;
-use connection_like::ConnectionLike;
-use errors::*;
-use io;
-use lib_futures::stream::{Stream, StreamFuture};
-use lib_futures::Async::Ready;
-use lib_futures::{Future, Poll};
-use myc::packets::{parse_err_packet, parse_ok_packet, RawPacket};
+use futures::{
+    stream::{Stream, StreamFuture},
+    try_ready,
+    Async::Ready,
+    Future, Poll,
+};
+use mysql_common::packets::{parse_err_packet, parse_ok_packet, RawPacket};
+
+use crate::{
+    connection_like::{streamless::Streamless, ConnectionLike},
+    error::*,
+    io,
+};
 
 pub struct ReadPacket<T> {
     conn_like: Option<Streamless<T>>,
@@ -54,7 +59,7 @@ impl<T: ConnectionLike> Future for ReadPacket<T> {
                 conn_like.set_seq_id(seq_id.wrapping_add(1));
                 Ok(Ready((conn_like, packet)))
             }
-            None => return Err(ErrorKind::ConnectionClosed.into()),
+            None => return Err(DriverError::ConnectionClosed.into()),
         }
     }
 }

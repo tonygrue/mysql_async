@@ -6,21 +6,28 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use self::futures::*;
-use conn::Conn;
-use errors::*;
-use lib_futures::task::{self, Task};
-use lib_futures::Async;
-use lib_futures::Async::NotReady;
-use lib_futures::Async::Ready;
-use lib_futures::Future;
-use opts::Opts;
-use queryable::transaction::{Transaction, TransactionOptions};
-use queryable::Queryable;
-use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard};
-use BoxFuture;
-use MyFuture;
+use ::futures::{
+    task::{self, Task},
+    Async::{self, NotReady, Ready},
+    Future,
+};
+
+use std::{
+    fmt,
+    str::FromStr,
+    sync::{Arc, Mutex, MutexGuard},
+};
+
+use crate::{
+    conn::{pool::futures::*, Conn},
+    error::*,
+    opts::{Opts, PoolConstraints},
+    queryable::{
+        transaction::{Transaction, TransactionOptions},
+        Queryable,
+    },
+    BoxFuture, MyFuture,
+};
 
 pub mod futures;
 
@@ -51,12 +58,11 @@ impl Inner {
 pub struct Pool {
     opts: Opts,
     inner: Arc<Mutex<Inner>>,
-    min: usize,
-    max: usize,
+    pool_constraints: PoolConstraints,
 }
 
 impl fmt::Debug for Pool {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (new_len, idle_len, disconnecing_len, dropping_len, rollback_len, ongoing, tasks_len) =
             self.with_inner(|inner| {
                 (
@@ -70,8 +76,7 @@ impl fmt::Debug for Pool {
                 )
             });
         f.debug_struct("Pool")
-            .field("min", &self.min)
-            .field("max", &self.max)
+            .field("pool_constraints", &self.pool_constraints)
             .field("new connections count", &new_len)
             .field("idle connections count", &idle_len)
             .field("disconnecting connections count", &disconnecing_len)
@@ -87,13 +92,12 @@ impl Pool {
     /// Creates new pool of connections.
     pub fn new<O: Into<Opts>>(opts: O) -> Pool {
         let opts = opts.into();
-        let pool_min = opts.get_pool_min();
-        let pool_max = opts.get_pool_max();
+        let pool_constraints = opts.get_pool_constraints().clone();
         let pool = Pool {
-            opts: opts,
+            opts,
             inner: Arc::new(Mutex::new(Inner {
                 closed: false,
-                new: Vec::with_capacity(pool_min),
+                new: Vec::with_capacity(pool_constraints.min()),
                 idle: Vec::new(),
                 disconnecting: Vec::new(),
                 dropping: Vec::new(),
@@ -101,11 +105,16 @@ impl Pool {
                 ongoing: 0,
                 tasks: Vec::new(),
             })),
-            min: pool_min,
-            max: pool_max,
+            pool_constraints,
         };
 
         pool
+    }
+
+    /// Creates new pool of connections.
+    pub fn from_url<T: AsRef<str>>(url: T) -> Result<Pool> {
+        let opts = Opts::from_str(url.as_ref())?;
+        Ok(Pool::new(opts))
     }
 
     /// Returns future that resolves to `Conn`.
@@ -176,7 +185,7 @@ impl Pool {
 
     /// A way to return connection taken from a pool.
     fn return_conn(&mut self, conn: Conn) {
-        let min = self.min;
+        let min = self.pool_constraints.min();
 
         self.with_inner(|mut inner| {
             if inner.closed {
@@ -204,7 +213,7 @@ impl Pool {
 
     fn with_inner<F, T>(&self, fun: F) -> T
     where
-        F: FnOnce(MutexGuard<Inner>) -> T,
+        F: FnOnce(MutexGuard<'_, Inner>) -> T,
         T: 'static,
     {
         fun(self.inner.lock().unwrap())
@@ -326,7 +335,7 @@ impl Pool {
     /// Will poll pool for connection.
     fn poll(&mut self) -> Result<Async<Conn>> {
         if self.with_inner(|inner| inner.closed) {
-            return Err(ErrorKind::PoolDisconnected.into());
+            return Err(DriverError::PoolDisconnected.into());
         }
 
         self.handle_futures()?;
@@ -335,7 +344,7 @@ impl Pool {
             Some(conn) => Ok(Ready(conn)),
             None => {
                 let new_conn_created = self.with_inner(|mut inner| {
-                    if inner.new.len() == 0 && inner.conn_count() < self.max {
+                    if inner.new.len() == 0 && inner.conn_count() < self.pool_constraints.max() {
                         let new_conn = Conn::new(self.opts.clone());
                         inner.new.push(Box::new(new_conn));
                         true
@@ -367,12 +376,11 @@ impl Drop for Conn {
 
 #[cfg(test)]
 mod test {
-    use conn::pool::Pool;
-    use lib_futures::Future;
-    use queryable::Queryable;
-    use test_misc::DATABASE_URL;
-    use tokio;
-    use TransactionOptions;
+    use futures::Future;
+
+    use crate::{
+        conn::pool::Pool, queryable::Queryable, test_misc::DATABASE_URL, TransactionOptions,
+    };
 
     /// Same as `tokio::run`, but will panic if future panics and will return the result
     /// of future execution.
@@ -521,12 +529,9 @@ mod test {
 
     #[cfg(feature = "nightly")]
     mod bench {
-        use conn::pool::Pool;
-        use lib_futures::Future;
-        use queryable::Queryable;
-        use test;
-        use test_misc::DATABASE_URL;
-        use tokio;
+        use futures::Future;
+
+        use crate::{conn::pool::Pool, queryable::Queryable, test_misc::DATABASE_URL};
 
         #[bench]
         fn connect(bencher: &mut test::Bencher) {

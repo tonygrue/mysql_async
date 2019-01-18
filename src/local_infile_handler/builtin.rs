@@ -6,19 +6,22 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use super::LocalInfileHandler;
-use lib_futures::IntoFuture;
+use futures::IntoFuture;
 use mio::{Evented, Poll, PollOpt, Ready, Registration, Token};
-use std::collections::HashSet;
-use std::fs;
-use std::io::{self, Read};
-use std::path::PathBuf;
-use std::str::from_utf8;
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::thread;
 use tokio::reactor::PollEvented2;
 use tokio_io::AsyncRead;
-use BoxFuture;
+
+use std::{
+    collections::HashSet,
+    fs,
+    io::{self, Read},
+    path::PathBuf,
+    str::from_utf8,
+    sync::mpsc::{channel, Receiver, Sender, TryRecvError},
+    thread,
+};
+
+use crate::{local_infile_handler::LocalInfileHandler, BoxFuture};
 
 #[derive(Debug)]
 enum Message {
@@ -114,7 +117,7 @@ impl Read for File {
                             return Err(io::Error::new(
                                 io::ErrorKind::Other,
                                 "Read thread disconnected",
-                            ))
+                            ));
                         }
                     }
                 }
@@ -178,15 +181,16 @@ impl WhiteListFsLocalInfileHandler {
 }
 
 impl LocalInfileHandler for WhiteListFsLocalInfileHandler {
-    fn handle(&self, file_name: &[u8]) -> BoxFuture<Box<AsyncRead + Send + 'static>> {
+    fn handle(&self, file_name: &[u8]) -> BoxFuture<Box<dyn AsyncRead + Send + 'static>> {
         let path: PathBuf = match from_utf8(file_name) {
             Ok(path_str) => path_str.into(),
             Err(_) => return Box::new(Err("Invalid file name".into()).into_future()),
         };
         if self.white_list.contains(&path) {
-            let fut = Ok(
-                Box::new(PollEvented2::new(File::new(path))) as Box<AsyncRead + Send + 'static>
-            ).into_future();
+            let fut =
+                Ok(Box::new(PollEvented2::new(File::new(path)))
+                    as Box<dyn AsyncRead + Send + 'static>)
+                .into_future();
             Box::new(fut) as BoxFuture<Box<_>>
         } else {
             let err_msg = format!("Path `{}' is not in white list", path.display());

@@ -6,22 +6,27 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use consts::CapabilityFlags;
-use errors::*;
+use url::{percent_encoding::percent_decode, Url};
 
-use local_infile_handler::{LocalInfileHandler, LocalInfileHandlerObject};
+use std::{
+    borrow::Cow,
+    net::{Ipv4Addr, Ipv6Addr},
+    path::Path,
+    str::FromStr,
+    sync::Arc,
+};
 
-use std::borrow::Cow;
-use std::net::{Ipv4Addr, Ipv6Addr};
-use std::path::Path;
-use std::str::FromStr;
-use std::sync::Arc;
+use crate::{
+    consts::CapabilityFlags,
+    error::*,
+    local_infile_handler::{LocalInfileHandler, LocalInfileHandlerObject},
+};
 
-use url::percent_encoding::percent_decode;
-use url::Url;
-
-const DEFAULT_MIN_CONNS: usize = 10;
-const DEFAULT_MAX_CONNS: usize = 100;
+const DEFAULT_POOL_CONSTRAINTS: PoolConstraints = PoolConstraints { min: 10, max: 100 };
+const_assert!(
+    _DEFAULT_POOL_CONSTRAINTS_ARE_CORRECT,
+    DEFAULT_POOL_CONSTRAINTS.min <= DEFAULT_POOL_CONSTRAINTS.max,
+);
 const DEFAULT_STMT_CACHE_SIZE: usize = 10;
 
 /// Ssl Options.
@@ -44,7 +49,10 @@ impl SslOpts {
     }
 
     /// Sets path to the pkcs12 archive.
-    pub fn set_pkcs12_path<T: Into<Cow<'static, Path>>>(&mut self, pkcs12_path: Option<T>) -> &mut Self {
+    pub fn set_pkcs12_path<T: Into<Cow<'static, Path>>>(
+        &mut self,
+        pkcs12_path: Option<T>,
+    ) -> &mut Self {
         self.pkcs12_path = pkcs12_path.map(Into::into);
         self
     }
@@ -120,11 +128,8 @@ pub struct InnerOpts {
     /// Local infile handler
     local_infile_handler: Option<LocalInfileHandlerObject>,
 
-    /// Lower bound of opened connections for `Pool` (defaults to 10).
-    pool_min: usize,
-
-    /// Upper bound of opened connections for `Pool` (defaults to 100).
-    pool_max: usize,
+    /// Bounds for the number of opened connections in `Pool` (defaults to `min: 10, max: 100`).
+    pool_constraints: PoolConstraints,
 
     /// Pool will close connection if time since last IO exceeds this value
     /// (defaults to `wait_timeout`).
@@ -166,7 +171,7 @@ impl Opts {
         }
     }
 
-    pub fn from_url(url: &str) -> Result<Opts> {
+    pub fn from_url(url: &str) -> std::result::Result<Opts, UrlError> {
         Ok(Opts {
             inner: Arc::new(from_url(url)?),
         })
@@ -213,21 +218,16 @@ impl Opts {
     }
 
     /// Local infile handler
-    pub fn get_local_infile_handler(&self) -> Option<Arc<LocalInfileHandler>> {
+    pub fn get_local_infile_handler(&self) -> Option<Arc<dyn LocalInfileHandler>> {
         self.inner
             .local_infile_handler
             .as_ref()
             .map(|x| x.clone_inner())
     }
 
-    /// Lower bound of opened connections for `Pool` (defaults to 10).
-    pub fn get_pool_min(&self) -> usize {
-        self.inner.pool_min
-    }
-
-    /// Upper bound of opened connections for `Pool` (defaults to 100).
-    pub fn get_pool_max(&self) -> usize {
-        self.inner.pool_max
+    /// /// Bounds for the number of opened connections in `Pool` (defaults to `min: 10, max: 100`).
+    pub fn get_pool_constraints(&self) -> &PoolConstraints {
+        &self.inner.pool_constraints
     }
 
     /// Pool will close connection if time since last IO exceeds this value
@@ -283,12 +283,54 @@ impl Default for InnerOpts {
             tcp_keepalive: None,
             tcp_nodelay: true,
             local_infile_handler: None,
-            pool_min: 10,
-            pool_max: 100,
+            pool_constraints: Default::default(),
             conn_ttl: None,
             stmt_cache_size: DEFAULT_STMT_CACHE_SIZE,
             ssl_opts: None,
         }
+    }
+}
+
+/// Connection pool constraints.
+///
+/// This type stores `min` and `max` constraints for `Pool` and ensures that `min <= max`.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct PoolConstraints {
+    min: usize,
+    max: usize,
+}
+
+impl PoolConstraints {
+    /// Creates new `PoolConstraints` if constraints are valid (`min <= max`).
+    pub fn new(min: usize, max: usize) -> Option<PoolConstraints> {
+        if min <= max {
+            Some(PoolConstraints { min, max })
+        } else {
+            None
+        }
+    }
+
+    /// Lower bound of this pool constraints.
+    pub fn min(&self) -> usize {
+        self.min
+    }
+
+    /// Upper bound of this pool constraints.
+    pub fn max(&self) -> usize {
+        self.max
+    }
+}
+
+impl Default for PoolConstraints {
+    fn default() -> Self {
+        DEFAULT_POOL_CONSTRAINTS
+    }
+}
+
+impl From<PoolConstraints> for (usize, usize) {
+    /// Transforms constraints to a pair of `(min, max)`.
+    fn from(PoolConstraints { min, max }: PoolConstraints) -> Self {
+        (min, max)
     }
 }
 
@@ -382,17 +424,9 @@ impl OptsBuilder {
         self
     }
 
-    /// Lower bound of opened connections for `Pool`
-    /// (defaults to `10`. `None` to reset to default).
-    pub fn pool_min<T: Into<usize>>(&mut self, pool_min: Option<T>) -> &mut Self {
-        self.opts.pool_min = pool_min.map(Into::into).unwrap_or(DEFAULT_MIN_CONNS);
-        self
-    }
-
-    /// Lower bound of opened connections for `Pool`
-    /// (defaults to `100`. `None` to reset to default).
-    pub fn pool_max<T: Into<usize>>(&mut self, pool_max: Option<T>) -> &mut Self {
-        self.opts.pool_max = pool_max.map(Into::into).unwrap_or(DEFAULT_MAX_CONNS);
+    /// Pool constraints. (defaults to `min: 10, max: 100`).
+    pub fn pool_constraints(&mut self, pool_constraints: Option<PoolConstraints>) -> &mut Self {
+        self.opts.pool_constraints = pool_constraints.unwrap_or(DEFAULT_POOL_CONSTRAINTS);
         self
     }
 
@@ -468,13 +502,17 @@ fn get_opts_db_name_from_url(url: &Url) -> Option<String> {
     }
 }
 
-fn from_url_basic(url_str: &str) -> Result<(InnerOpts, Vec<(String, String)>)> {
+fn from_url_basic(
+    url_str: &str,
+) -> std::result::Result<(InnerOpts, Vec<(String, String)>), UrlError> {
     let url = Url::parse(url_str)?;
     if url.scheme() != "mysql" {
-        return Err(ErrorKind::UrlUnsupportedScheme(url.scheme().to_string()).into());
+        return Err(UrlError::UnsupportedScheme {
+            scheme: url.scheme().to_string(),
+        });
     }
     if url.cannot_be_a_base() || !url.has_host() {
-        return Err(ErrorKind::UrlInvalid.into());
+        return Err(UrlError::Invalid);
     }
     let user = get_opts_user_from_url(&url);
     let pass = get_opts_pass_from_url(&url);
@@ -498,38 +536,59 @@ fn from_url_basic(url_str: &str) -> Result<(InnerOpts, Vec<(String, String)>)> {
     Ok((opts, query_pairs))
 }
 
-fn from_url(url: &str) -> Result<InnerOpts> {
+fn from_url(url: &str) -> std::result::Result<InnerOpts, UrlError> {
     let (mut opts, query_pairs) = from_url_basic(url)?;
+    let mut pool_min = DEFAULT_POOL_CONSTRAINTS.min;
+    let mut pool_max = DEFAULT_POOL_CONSTRAINTS.max;
     for (key, value) in query_pairs {
         if key == "pool_min" {
             match usize::from_str(&*value) {
-                Ok(value) => opts.pool_min = value,
-                _ => return Err(ErrorKind::UrlInvalidParamValue("pool_min".into(), value).into()),
+                Ok(value) => pool_min = value,
+                _ => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: "pool_min".into(),
+                        value,
+                    });
+                }
             }
         } else if key == "pool_max" {
             match usize::from_str(&*value) {
-                Ok(value) => opts.pool_max = value,
-                _ => return Err(ErrorKind::UrlInvalidParamValue("pool_max".into(), value).into()),
+                Ok(value) => pool_max = value,
+                _ => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: "pool_max".into(),
+                        value,
+                    });
+                }
             }
         } else if key == "conn_ttl" {
             match u32::from_str(&*value) {
                 Ok(value) => opts.conn_ttl = Some(value),
-                _ => return Err(ErrorKind::UrlInvalidParamValue("conn_ttl".into(), value).into()),
+                _ => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: "conn_ttl".into(),
+                        value,
+                    });
+                }
             }
         } else if key == "tcp_keepalive" {
             match u32::from_str(&*value) {
                 Ok(value) => opts.tcp_keepalive = Some(value),
                 _ => {
-                    return Err(
-                        ErrorKind::UrlInvalidParamValue("tcp_keepalive_ms".into(), value).into(),
-                    )
+                    return Err(UrlError::InvalidParamValue {
+                        param: "tcp_keepalive_ms".into(),
+                        value,
+                    });
                 }
             }
         } else if key == "tcp_nodelay" {
             match bool::from_str(&*value) {
                 Ok(value) => opts.tcp_nodelay = value,
                 _ => {
-                    return Err(ErrorKind::UrlInvalidParamValue("tcp_nodelay".into(), value).into())
+                    return Err(UrlError::InvalidParamValue {
+                        param: "tcp_nodelay".into(),
+                        value,
+                    });
                 }
             }
         } else if key == "stmt_cache_size" {
@@ -538,19 +597,35 @@ fn from_url(url: &str) -> Result<InnerOpts> {
                     opts.stmt_cache_size = stmt_cache_size;
                 }
                 _ => {
-                    return Err(
-                        ErrorKind::UrlInvalidParamValue("stmt_cache_size".into(), value).into(),
-                    );
+                    return Err(UrlError::InvalidParamValue {
+                        param: "stmt_cache_size".into(),
+                        value,
+                    });
                 }
             }
         } else {
-            return Err(ErrorKind::UrlUnknownParameter(key).into());
+            return Err(UrlError::UnknownParameter { param: key });
         }
     }
-    if opts.pool_min > opts.pool_max {
-        return Err(ErrorKind::InvalidPoolConstraints(opts.pool_min, opts.pool_max).into());
+
+    if let Some(pool_constraints) = PoolConstraints::new(pool_min, pool_max) {
+        opts.pool_constraints = pool_constraints;
+    } else {
+        return Err(UrlError::InvalidPoolConstraints {
+            min: pool_min,
+            max: pool_max,
+        });
     }
+
     Ok(opts)
+}
+
+impl FromStr for Opts {
+    type Err = UrlError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, <Self as FromStr>::Err> {
+        Opts::from_url(s)
+    }
 }
 
 impl<T: AsRef<str> + Sized> From<T> for Opts {

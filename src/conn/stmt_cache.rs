@@ -6,14 +6,17 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use queryable::stmt::InnerStmt;
-use std::borrow::Borrow;
-use std::collections::hash_map::IntoIter;
+use twox_hash::XxHash;
+
 #[cfg(test)]
 use std::collections::vec_deque::Iter;
-use std::collections::{HashMap, VecDeque};
-use std::hash::{BuildHasherDefault, Hash};
-use twox_hash::XxHash;
+use std::{
+    borrow::Borrow,
+    collections::{hash_map::IntoIter, HashMap, VecDeque},
+    hash::{BuildHasherDefault, Hash},
+};
+
+use crate::queryable::stmt::InnerStmt;
 
 #[derive(Debug)]
 pub struct StmtCache {
