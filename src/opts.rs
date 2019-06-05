@@ -36,6 +36,7 @@ pub struct SslOpts {
     password: Option<Cow<'static, str>>,
     root_cert_path: Option<Cow<'static, Path>>,
     skip_domain_validation: bool,
+    accept_invalid_certs: bool,
 }
 
 impl SslOpts {
@@ -45,6 +46,7 @@ impl SslOpts {
             password: None,
             root_cert_path: None,
             skip_domain_validation: false,
+            accept_invalid_certs: false,
         }
     }
 
@@ -79,6 +81,13 @@ impl SslOpts {
         self
     }
 
+    /// If `true` then client will accept invalid certificate (expired, not trusted, ..)
+    /// (defaults to `false`).
+    pub fn set_danger_accept_invalid_certs(&mut self, value: bool) -> &mut Self {
+        self.accept_invalid_certs = value;
+        self
+    }
+
     pub fn pkcs12_path(&self) -> Option<&Path> {
         self.pkcs12_path.as_ref().map(|x| x.as_ref())
     }
@@ -93,6 +102,10 @@ impl SslOpts {
 
     pub fn skip_domain_validation(&self) -> bool {
         self.skip_domain_validation
+    }
+
+    pub fn accept_invalid_certs(&self) -> bool {
+        self.accept_invalid_certs
     }
 }
 
@@ -145,6 +158,22 @@ pub struct InnerOpts {
     ///
     /// This option requires `ssl` feature to work.
     ssl_opts: Option<SslOpts>,
+
+    /// Prefer socket connection (defaults to `true`).
+    ///
+    /// Will reconnect via socket (or named pipe on Windows) after TCP connection to `127.0.0.1`
+    /// if `true`.
+    ///
+    /// Will fall back to TCP on error. Use `socket` option to enforce socket connection.
+    ///
+    /// # Note
+    ///
+    /// Library will query the `@@socket` server variable to get socket address,
+    /// and this address may be incorrect in some cases (i.e. docker).
+    prefer_socket: bool,
+
+    /// Path to unix socket (or named pipe on Windows) (defaults to `None`).
+    socket: Option<String>,
 }
 
 /// Mysql connection options.
@@ -248,6 +277,31 @@ impl Opts {
         self.inner.ssl_opts.as_ref()
     }
 
+    /// Will prefer socket connection if `true` (defaults to `true`).
+    pub fn get_perfer_socket(&self) -> bool {
+        self.inner.prefer_socket
+    }
+
+    /// Prefer socket connection (defaults to `true`).
+    ///
+    /// Will reconnect via socket (or named pipe on Windows) after TCP connection to `127.0.0.1`
+    /// if `true`.
+    ///
+    /// Will fall back to TCP on error. Use `socket` option to enforce socket connection.
+    ///
+    /// # Note
+    ///
+    /// Library will query the `@@socket` server variable to get socket address,
+    /// and this address may be incorrect in some cases (i.e. docker).
+    pub fn get_prefer_socket(&self) -> bool {
+        self.inner.prefer_socket
+    }
+
+    /// Socket path (defaults to `None`).
+    pub fn get_socket(&self) -> Option<&str> {
+        self.inner.socket.as_ref().map(|x| &**x)
+    }
+
     pub(crate) fn get_capabilities(&self) -> CapabilityFlags {
         let mut out = CapabilityFlags::CLIENT_PROTOCOL_41
             | CapabilityFlags::CLIENT_SECURE_CONNECTION
@@ -287,6 +341,8 @@ impl Default for InnerOpts {
             conn_ttl: None,
             stmt_cache_size: DEFAULT_STMT_CACHE_SIZE,
             ssl_opts: None,
+            prefer_socket: true,
+            socket: None,
         }
     }
 }
@@ -455,6 +511,28 @@ impl OptsBuilder {
         self.opts.ssl_opts = ssl_opts.into();
         self
     }
+
+    /// Prefer socket connection (defaults to `true`).
+    ///
+    /// Will reconnect via socket (or named pipe on Windows) after TCP connection to `127.0.0.1`
+    /// if `true`.
+    ///
+    /// Will fall back to TCP on error. Use `socket` option to enforce socket connection.
+    ///
+    /// # Note
+    ///
+    /// Library will query the `@@socket` server variable to get socket address,
+    /// and this address may be incorrect in some cases (i.e. docker).
+    pub fn prefer_socket<T: Into<Option<bool>>>(&mut self, prefer_socket: T) -> &mut Self {
+        self.opts.prefer_socket = prefer_socket.into().unwrap_or(true);
+        self
+    }
+
+    /// Path to unix socket (or named pipe on Windows) (defaults to `None`).
+    pub fn socket<T: Into<String>>(&mut self, socket: Option<T>) -> &mut Self {
+        self.opts.socket = socket.map(Into::into);
+        self
+    }
 }
 
 impl From<OptsBuilder> for Opts {
@@ -537,7 +615,7 @@ fn from_url_basic(
 }
 
 fn from_url(url: &str) -> std::result::Result<InnerOpts, UrlError> {
-    let (mut opts, query_pairs) = from_url_basic(url)?;
+    let (mut opts, query_pairs): (InnerOpts, _) = from_url_basic(url)?;
     let mut pool_min = DEFAULT_POOL_CONSTRAINTS.min;
     let mut pool_max = DEFAULT_POOL_CONSTRAINTS.max;
     for (key, value) in query_pairs {
@@ -603,6 +681,20 @@ fn from_url(url: &str) -> std::result::Result<InnerOpts, UrlError> {
                     });
                 }
             }
+        } else if key == "prefer_socket" {
+            match bool::from_str(&*value) {
+                Ok(prefer_socket) => {
+                    opts.prefer_socket = prefer_socket;
+                }
+                _ => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: "prefer_socket".into(),
+                        value,
+                    });
+                }
+            }
+        } else if key == "socket" {
+            opts.socket = Some(value)
         } else {
             return Err(UrlError::UnknownParameter { param: key });
         }

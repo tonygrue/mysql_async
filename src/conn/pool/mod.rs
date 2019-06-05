@@ -34,22 +34,15 @@ pub mod futures;
 pub struct Inner {
     closed: bool,
     new: Vec<BoxFuture<Conn>>,
+    queue: Vec<BoxFuture<Conn>>,
     idle: Vec<Conn>,
-    disconnecting: Vec<BoxFuture<()>>,
-    dropping: Vec<BoxFuture<Conn>>,
-    rollback: Vec<BoxFuture<Conn>>,
     ongoing: usize,
     tasks: Vec<Task>,
 }
 
 impl Inner {
     fn conn_count(&self) -> usize {
-        self.new.len()
-            + self.idle.len()
-            + self.disconnecting.len()
-            + self.dropping.len()
-            + self.rollback.len()
-            + self.ongoing
+        self.new.len() + self.idle.len() + self.queue.len() + self.ongoing
     }
 }
 
@@ -63,25 +56,20 @@ pub struct Pool {
 
 impl fmt::Debug for Pool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (new_len, idle_len, disconnecing_len, dropping_len, rollback_len, ongoing, tasks_len) =
-            self.with_inner(|inner| {
-                (
-                    inner.new.len(),
-                    inner.idle.len(),
-                    inner.disconnecting.len(),
-                    inner.dropping.len(),
-                    inner.rollback.len(),
-                    inner.ongoing,
-                    inner.tasks.len(),
-                )
-            });
+        let (new_len, idle_len, queue_len, ongoing, tasks_len) = self.with_inner(|inner| {
+            (
+                inner.new.len(),
+                inner.idle.len(),
+                inner.queue.len(),
+                inner.ongoing,
+                inner.tasks.len(),
+            )
+        });
         f.debug_struct("Pool")
             .field("pool_constraints", &self.pool_constraints)
             .field("new connections count", &new_len)
             .field("idle connections count", &idle_len)
-            .field("disconnecting connections count", &disconnecing_len)
-            .field("dropping connections count", &dropping_len)
-            .field("rollback connections count", &rollback_len)
+            .field("queue length", &queue_len)
             .field("ongoing connections count", &ongoing)
             .field("tasks count", &tasks_len)
             .finish()
@@ -99,9 +87,7 @@ impl Pool {
                 closed: false,
                 new: Vec::with_capacity(pool_constraints.min()),
                 idle: Vec::new(),
-                disconnecting: Vec::new(),
-                dropping: Vec::new(),
-                rollback: Vec::new(),
+                queue: Vec::new(),
                 ongoing: 0,
                 tasks: Vec::new(),
             })),
@@ -146,7 +132,7 @@ impl Pool {
         });
         if become_closed {
             while let Some(conn) = self.take_conn() {
-                self.with_inner(move |mut inner| inner.disconnecting.push(conn.disconnect()));
+                crate::conn::disconnect(conn);
             }
         }
         new_disconnect_pool(self)
@@ -155,26 +141,19 @@ impl Pool {
     /// Returns true if futures is in queue.
     fn in_queue(&self) -> bool {
         self.with_inner(|inner| {
-            let count = inner.new.len()
-                + inner.disconnecting.len()
-                + inner.dropping.len()
-                + inner.rollback.len();
+            let count = inner.new.len() + inner.queue.len();
             count > 0
         })
     }
 
     /// A way to take connection from a pool.
     fn take_conn(&mut self) -> Option<Conn> {
-        if self.in_queue() {
-            // Do not return connection until queue is empty
-            return None;
-        }
         self.with_inner(|mut inner| {
             while let Some(mut conn) = inner.idle.pop() {
                 if conn.expired() {
-                    inner.disconnecting.push(conn.disconnect());
+                    crate::conn::disconnect(conn);
                 } else {
-                    conn.pool = Some(self.clone());
+                    conn.inner.pool = Some(self.clone());
                     inner.ongoing += 1;
                     return Some(conn);
                 }
@@ -188,19 +167,23 @@ impl Pool {
         let min = self.pool_constraints.min();
 
         self.with_inner(|mut inner| {
+            inner.ongoing -= 1;
+
             if inner.closed {
                 return;
             }
 
-            if conn.has_result.is_some() {
-                inner.dropping.push(Box::new(conn.drop_result()));
-            } else if conn.in_transaction {
-                inner.rollback.push(Box::new(conn.rollback_transaction()));
+            if conn.inner.stream.is_none() {
+                // drop incomplete connection
+                return;
+            }
+
+            if conn.inner.in_transaction || conn.inner.has_result.is_some() {
+                inner.queue.push(conn.cleanup());
             } else {
                 if inner.idle.len() >= min {
-                    inner.disconnecting.push(conn.disconnect());
+                    crate::conn::disconnect(conn);
                 } else {
-                    inner.ongoing -= 1;
                     inner.idle.push(conn);
                 }
             }
@@ -226,104 +209,81 @@ impl Pool {
             return Ok(());
         }
 
-        macro_rules! handle {
-            ($vec:ident { $($p:pat => $b:block,)+ }) => ({
-                let len = self.with_inner(|inner| inner.$vec.len());
-                let mut done_fut_idxs = Vec::new();
-                for i in 0..len {
-                    let result = self.with_inner(|mut inner| inner.$vec.get_mut(i).unwrap().poll());
-                    match result {
-                        Ok(Ready(_)) | Err(_) => done_fut_idxs.push(i),
-                        _ => (),
-                    }
-
-                    let out: Result<()> = match result {
-                        $($p => $b),+
-                        _ => {
-                            Ok(())
-                        }
-                    };
-
-                    match out {
-                        Err(err) => {
-                            // early return in case of error
-                            while let Some(i) = done_fut_idxs.pop() {
-                                let _ = self.with_inner(|mut inner| inner.$vec.swap_remove(i));
-                            }
-                            return Err(err)
-                        }
-                        _ => (),
-                    }
-                }
-
-                while let Some(i) = done_fut_idxs.pop() {
-                    let _ = self.with_inner(|mut inner| inner.$vec.swap_remove(i));
-                }
-            });
-        }
-
         let mut handled = false;
 
-        // Handle closing connections.
-        handle!(disconnecting {
-            Ok(Ready(_)) => {
-                handled = true;
-                Ok(())
-            },
-            Err(_) => { Ok(()) },
-        });
+        let mut returned_conns: Vec<Conn> = vec![];
 
-        // Handle dirty connections.
-        handle!(dropping {
-            Ok(Ready(conn)) => {
-                let closed = self.with_inner(|inner| inner.closed);
-                if closed {
-                    self.with_inner(|mut inner| inner.disconnecting.push(conn.disconnect()));
-                } else {
-                    self.return_conn(conn);
-                }
-                handled = true;
-                Ok(())
-            },
-            Err(_) => { Ok(()) },
-        });
+        self.with_inner(|mut inner| {
+            macro_rules! handle {
+                ($vec:ident { $($p:pat => $b:block,)+ }) => ({
+                    let len = inner.$vec.len();
+                    let mut done_fut_idxs = Vec::new();
 
-        // Handle in-transaction connections
-        handle!(rollback {
-            Ok(Ready(conn)) => {
-                let closed = self.with_inner(|inner| inner.closed);
-                if closed {
-                    self.with_inner(|mut inner| inner.disconnecting.push(conn.disconnect()));
-                } else {
-                    self.return_conn(conn);
-                }
-                handled = true;
-                Ok(())
-            },
-            Err(_) => { Ok(()) },
-        });
+                    for i in 0..len {
+                        let result = inner.$vec.get_mut(i).unwrap().poll();
+                        match result {
+                            Ok(Ready(_)) | Err(_) => done_fut_idxs.push(i),
+                            _ => (),
+                        }
 
-        // Handle connecting connections.
-        handle!(new {
-            Ok(Ready(conn)) => {
-                let closed = self.with_inner(|inner| inner.closed);
-                if closed {
-                    self.with_inner(|mut inner| inner.disconnecting.push(conn.disconnect()));
-                } else {
-                    self.with_inner(|mut inner| inner.ongoing += 1);
-                    self.return_conn(conn);
-                }
-                handled = true;
-                Ok(())
-            },
-            Err(err) => {
-                if ! self.with_inner(|inner| inner.closed) {
-                    Err(err)
-                } else {
-                    Ok(())
-                }
-            },
-        });
+                        let out: Result<()> = match result {
+                            Ok(Ready(conn)) => {
+                                if inner.closed {
+                                    crate::conn::disconnect(conn);
+                                } else {
+                                    inner.ongoing += 1;
+                                    returned_conns.push(conn);
+                                }
+                                handled = true;
+                                Ok(())
+                            }
+                            $($p => $b),+
+                            _ => {
+                                Ok(())
+                            }
+                        };
+
+                        match out {
+                            Err(err) => {
+                                // early return in case of error
+                                while let Some(i) = done_fut_idxs.pop() {
+                                    inner.$vec.swap_remove(i);
+                                }
+                                return Err(err)
+                            }
+                            _ => (),
+                        }
+                    }
+
+                    while let Some(i) = done_fut_idxs.pop() {
+                        inner.$vec.swap_remove(i);
+                    }
+                });
+            }
+
+            // Handle dirty connections.
+            handle!(queue {
+                // Drop it in case of error.
+                Err(_) => { Ok(()) },
+            });
+
+            // Handle connecting connections.
+            handle!(new {
+                Err(err) => {
+                    if !inner.closed {
+                        Err(err)
+                    } else {
+                        Ok(())
+                    }
+                },
+            });
+
+            Ok(())
+        })?;
+
+        for conn in returned_conns {
+            self.return_conn(conn);
+        }
 
         if handled {
             self.handle_futures()
@@ -365,17 +325,17 @@ impl Pool {
 
 impl Drop for Conn {
     fn drop(&mut self) {
-        if let Some(mut pool) = self.pool.take() {
-            let conn = self.take();
-            if conn.stream.is_some() {
-                pool.return_conn(conn)
-            } // drop incomplete connection
+        if let Some(mut pool) = self.inner.pool.take() {
+            pool.return_conn(self.take());
+        } else if self.inner.stream.is_some() && !self.inner.disconnected {
+            crate::conn::disconnect(self.take());
         }
     }
 }
 
 #[cfg(test)]
 mod test {
+    use futures::collect;
     use futures::Future;
 
     use crate::{
@@ -438,6 +398,63 @@ mod test {
     }
 
     #[test]
+    fn should_hold_bounds2() {
+        use std::cmp::max;
+
+        const POOL_MIN: usize = 5;
+        const POOL_MAX: usize = 10;
+
+        let url = format!(
+            "{}?pool_min={}&pool_max={}",
+            &**DATABASE_URL, POOL_MIN, POOL_MAX
+        );
+
+        // Clean
+        let pool = Pool::new(url.clone());
+        let pool_clone = pool.clone();
+        let conns = (0..POOL_MAX).map(|_| pool.get_conn()).collect::<Vec<_>>();
+
+        let fut = ::futures::future::join_all(conns)
+            .map(move |mut conns| {
+                let mut popped = 0;
+                assert_eq!(pool_clone.inner.lock().unwrap().conn_count(), POOL_MAX);
+
+                while let Some(_) = conns.pop().map(drop) {
+                    popped += 1;
+                    assert_eq!(
+                        pool_clone.inner.lock().unwrap().conn_count(),
+                        POOL_MAX + POOL_MIN - max(popped, POOL_MIN)
+                    );
+                }
+
+                pool_clone
+            })
+            .and_then(|pool| pool.disconnect());
+
+        run(fut).unwrap();
+
+        // Dirty
+        let pool = Pool::new(url.clone());
+        let pool_clone = pool.clone();
+        let conns = (0..POOL_MAX)
+            .map(|_| {
+                pool.get_conn()
+                    .and_then(|conn| conn.start_transaction(TransactionOptions::new()))
+            })
+            .collect::<Vec<_>>();
+
+        let fut = ::futures::future::join_all(conns).map(move |mut conns| {
+            assert_eq!(pool_clone.inner.lock().unwrap().conn_count(), POOL_MAX);
+
+            while let Some(_) = conns.pop().map(drop) {
+                assert_eq!(pool_clone.inner.lock().unwrap().conn_count(), POOL_MAX);
+            }
+        });
+
+        run(fut).unwrap();
+    }
+
+    #[test]
     fn should_hold_bounds() {
         let pool = Pool::new(format!("{}?pool_min=1&pool_max=2", &**DATABASE_URL));
         let pool_clone = pool.clone();
@@ -446,9 +463,10 @@ mod test {
             .join(pool.get_conn())
             .and_then(move |(mut conn1, conn2)| {
                 let new_conn = pool_clone.get_conn();
-                conn1.pool.as_mut().unwrap().handle_futures().unwrap();
+                conn1.inner.pool.as_mut().unwrap().handle_futures().unwrap();
                 assert_eq!(
                     conn1
+                        .inner
                         .pool
                         .as_ref()
                         .unwrap()
@@ -457,6 +475,7 @@ mod test {
                 );
                 assert_eq!(
                     conn1
+                        .inner
                         .pool
                         .as_ref()
                         .unwrap()
@@ -465,18 +484,11 @@ mod test {
                 );
                 assert_eq!(
                     conn2
+                        .inner
                         .pool
                         .as_ref()
                         .unwrap()
-                        .with_inner(|inner| inner.disconnecting.len()),
-                    0
-                );
-                assert_eq!(
-                    conn2
-                        .pool
-                        .as_ref()
-                        .unwrap()
-                        .with_inner(|inner| inner.dropping.len()),
+                        .with_inner(|inner| inner.queue.len()),
                     0
                 );
                 new_conn
@@ -484,6 +496,7 @@ mod test {
             .and_then(|conn1| {
                 assert_eq!(
                     conn1
+                        .inner
                         .pool
                         .as_ref()
                         .unwrap()
@@ -492,6 +505,7 @@ mod test {
                 );
                 assert_eq!(
                     conn1
+                        .inner
                         .pool
                         .as_ref()
                         .unwrap()
@@ -500,18 +514,11 @@ mod test {
                 );
                 assert_eq!(
                     conn1
+                        .inner
                         .pool
                         .as_ref()
                         .unwrap()
-                        .with_inner(|inner| inner.disconnecting.len()),
-                    0
-                );
-                assert_eq!(
-                    conn1
-                        .pool
-                        .as_ref()
-                        .unwrap()
-                        .with_inner(|inner| inner.dropping.len()),
+                        .with_inner(|inner| inner.queue.len()),
                     0
                 );
                 Ok(())
@@ -519,28 +526,38 @@ mod test {
             .and_then(|_| {
                 assert_eq!(pool.with_inner(|inner| inner.new.len()), 0);
                 assert_eq!(pool.with_inner(|inner| inner.idle.len()), 1);
-                assert_eq!(pool.with_inner(|inner| inner.disconnecting.len()), 0);
-                assert_eq!(pool.with_inner(|inner| inner.dropping.len()), 0);
+                assert_eq!(pool.with_inner(|inner| inner.queue.len()), 0);
                 pool.disconnect()
             });
 
         run(fut).unwrap();
     }
 
+    #[test]
+    fn should_not_panic_if_dropped_without_tokio_runtime() {
+        let pool = Pool::new(&**DATABASE_URL);
+        run(collect(
+            (0..10).map(|_| pool.get_conn()).collect::<Vec<_>>(),
+        ))
+        .unwrap();
+        // pool will drop here
+    }
+
     #[cfg(feature = "nightly")]
     mod bench {
         use futures::Future;
+        use tokio::runtime::Runtime;
 
         use crate::{conn::pool::Pool, queryable::Queryable, test_misc::DATABASE_URL};
 
         #[bench]
         fn connect(bencher: &mut test::Bencher) {
-            let mut runtime = tokio::executor::current_thread::CurrentThread::new();
+            let mut runtime = Runtime::new().expect("3");
             let pool = Pool::new(&**DATABASE_URL);
 
             bencher.iter(|| {
                 let fut = pool.get_conn().and_then(|conn| conn.ping());
-                runtime.block_on(fut).unwrap();
+                runtime.block_on(fut).expect("1");
             });
 
             runtime.block_on(pool.disconnect()).unwrap();

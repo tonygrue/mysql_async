@@ -32,15 +32,11 @@ impl Future for DisconnectPool {
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         self.pool.handle_futures()?;
 
-        let (new_len, dropping_len, disconnecting_len) = self.pool.with_inner(|inner| {
-            (
-                inner.new.len(),
-                inner.dropping.len(),
-                inner.disconnecting.len(),
-            )
-        });
+        let (new_len, queue_len) = self
+            .pool
+            .with_inner(|inner| (inner.new.len(), inner.queue.len()));
 
-        if (new_len, dropping_len, disconnecting_len) == (0, 0, 0) {
+        if (new_len, queue_len) == (0, 0) {
             Ok(Ready(()))
         } else {
             Ok(NotReady)
