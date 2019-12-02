@@ -6,7 +6,8 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use url::{percent_encoding::percent_decode, Url};
+use percent_encoding::percent_decode;
+use url::Url;
 
 use std::{
     borrow::Cow,
@@ -14,6 +15,7 @@ use std::{
     path::Path,
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 
 use crate::{
@@ -29,8 +31,19 @@ const_assert!(
 );
 const DEFAULT_STMT_CACHE_SIZE: usize = 10;
 
+/// Default `inactive_connection_ttl` of a pool.
+///
+/// `0` value means, that connection will be dropped immediately
+/// if it is outside of the pool's lower bound.
+pub const DEFAULT_INACTIVE_CONNECTION_TTL: Duration = Duration::from_secs(0);
+
+/// Default `ttl_check_interval` of a pool.
+///
+/// It isn't used if `inactive_connection_ttl` is `0`.
+pub const DEFAULT_TTL_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Ssl Options.
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Default)]
 pub struct SslOpts {
     pkcs12_path: Option<Cow<'static, Path>>,
     password: Option<Cow<'static, str>>,
@@ -40,16 +53,6 @@ pub struct SslOpts {
 }
 
 impl SslOpts {
-    pub fn new() -> SslOpts {
-        SslOpts {
-            pkcs12_path: None,
-            password: None,
-            root_cert_path: None,
-            skip_domain_validation: false,
-            accept_invalid_certs: false,
-        }
-    }
-
     /// Sets path to the pkcs12 archive.
     pub fn set_pkcs12_path<T: Into<Cow<'static, Path>>>(
         &mut self,
@@ -109,9 +112,111 @@ impl SslOpts {
     }
 }
 
+/// Connection pool options.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct PoolOptions {
+    constraints: PoolConstraints,
+    inactive_connection_ttl: Duration,
+    ttl_check_interval: Duration,
+}
+
+impl PoolOptions {
+    /// Creates [`PoolOptions`].
+    pub const fn new(
+        constraints: PoolConstraints,
+        inactive_connection_ttl: Duration,
+        ttl_check_interval: Duration,
+    ) -> Self {
+        Self {
+            constraints,
+            inactive_connection_ttl,
+            ttl_check_interval,
+        }
+    }
+
+    /// Creates default [`PoolOptions`] with given constraints.
+    pub const fn with_constraints(constraints: PoolConstraints) -> Self {
+        Self {
+            constraints,
+            inactive_connection_ttl: DEFAULT_INACTIVE_CONNECTION_TTL,
+            ttl_check_interval: DEFAULT_TTL_CHECK_INTERVAL,
+        }
+    }
+
+    /// Sets pool constraints.
+    pub fn set_constraints(&mut self, constraints: PoolConstraints) {
+        self.constraints = constraints;
+    }
+
+    /// Returns `constrains` value.
+    pub fn constraints(&self) -> PoolConstraints {
+        self.constraints
+    }
+
+    /// Pool will recycle inactive connection if it outside of the lower bound of a pool
+    /// and if it is idling longer than this value (defaults to [`DEFAULT_INACTIVE_CONNECTION_TTL`]).
+    ///
+    /// Note that it may, actually, idle longer because of [`PoolOptions::ttl_check_interval`].
+    pub fn set_inactive_connection_ttl(&mut self, ttl: Duration) {
+        self.inactive_connection_ttl = ttl;
+    }
+
+    /// Returns `inactive_connection_ttl` value.
+    pub fn inactive_connection_ttl(&self) -> Duration {
+        self.inactive_connection_ttl
+    }
+
+    /// Pool will check idling connection for expiration with this interval
+    /// (defaults to [`DEFAULT_TTL_CHECK_INTERVAL`]).
+    ///
+    /// If `interval` is less than one second, then [`DEFAULT_TTL_CHECK_INTERVAL`] will be used.
+    pub fn set_ttl_check_interval(&mut self, interval: Duration) {
+        if interval < Duration::from_secs(1) {
+            self.ttl_check_interval = DEFAULT_TTL_CHECK_INTERVAL
+        } else {
+            self.ttl_check_interval = interval;
+        }
+    }
+
+    /// Returns `ttl_check_interval` value.
+    pub fn ttl_check_interval(&self) -> Duration {
+        self.ttl_check_interval
+    }
+
+    /// Returns active bound for this `PoolOptions`.
+    ///
+    /// This value controls how many connections will be returned to an idle queue of a pool.
+    ///
+    /// Active bound is either:
+    /// * `min` bound of the pool constraints, if this [`PoolOptions`] defines
+    ///   `inactive_connection_ttl` to be `0`. This means, that pool will hold no more than `min`
+    ///   number of idling connection and other connection will be immediately disconnected.
+    /// * `max` bound of the pool constraints, if this [`PoolOptions`] defines
+    ///   `inactive_connection_ttl` to be non-zero. This means, that pool will hold up to `max`
+    ///   number of idling connections and this number will be eventually reduced to `min`
+    ///   by a handler of `ttl_check_interval`.
+    pub(crate) fn active_bound(&self) -> usize {
+        if self.inactive_connection_ttl > Duration::from_secs(0) {
+            self.constraints.max
+        } else {
+            self.constraints.min
+        }
+    }
+}
+
+impl Default for PoolOptions {
+    fn default() -> Self {
+        Self {
+            constraints: DEFAULT_POOL_CONSTRAINTS,
+            inactive_connection_ttl: DEFAULT_INACTIVE_CONNECTION_TTL,
+            ttl_check_interval: DEFAULT_TTL_CHECK_INTERVAL,
+        }
+    }
+}
+
 /// Mysql connection options.
 ///
-/// Build one with [`OptsBuilder`](struct.OptsBuilder.html).
+/// Build one with [`OptsBuilder`].
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct InnerOpts {
     /// Address of mysql server (defaults to `127.0.0.1`). Host names should also work.
@@ -141,12 +246,12 @@ pub struct InnerOpts {
     /// Local infile handler
     local_infile_handler: Option<LocalInfileHandlerObject>,
 
-    /// Bounds for the number of opened connections in `Pool` (defaults to `min: 10, max: 100`).
-    pool_constraints: PoolConstraints,
+    /// Connection pool options (defaults to [`PoolOptions::default`]).
+    pool_options: PoolOptions,
 
-    /// Pool will close connection if time since last IO exceeds this value
+    /// Pool will close connection if time since last IO exceeds this number of seconds
     /// (defaults to `wait_timeout`).
-    conn_ttl: Option<u32>,
+    conn_ttl: Option<Duration>,
 
     /// Commands to execute on each new database connection.
     init: Vec<String>,
@@ -155,8 +260,6 @@ pub struct InnerOpts {
     stmt_cache_size: usize,
 
     /// Driver will require SSL connection if this option isn't `None` (default to `None`).
-    ///
-    /// This option requires `ssl` feature to work.
     ssl_opts: Option<SslOpts>,
 
     /// Prefer socket connection (defaults to `true`).
@@ -174,11 +277,23 @@ pub struct InnerOpts {
 
     /// Path to unix socket (or named pipe on Windows) (defaults to `None`).
     socket: Option<String>,
+
+    /// If not `None`, then client will ask for compression if server supports it
+    /// (defaults to `None`).
+    ///
+    /// Can be defined using `compress` connection url parameter with values:
+    /// * `fast` - for compression level 1;
+    /// * `best` - for compression level 9;
+    /// * `on`, `true` - for default compression level;
+    /// * `0`, ..., `9`.
+    ///
+    /// Note that compression level defined here will affect only outgoing packets.
+    compression: Option<crate::Compression>,
 }
 
 /// Mysql connection options.
 ///
-/// Build one with [`OptsBuilder`](struct.OptsBuilder.html).
+/// Build one with [`OptsBuilder`].
 #[derive(Clone, Eq, PartialEq, Debug, Default)]
 pub struct Opts {
     inner: Arc<InnerOpts>,
@@ -193,10 +308,8 @@ impl Opts {
             addr.is_loopback()
         } else if let Some(addr) = v6addr {
             addr.is_loopback()
-        } else if self.inner.ip_or_hostname == "localhost" {
-            true
         } else {
-            false
+            self.inner.ip_or_hostname == "localhost"
         }
     }
 
@@ -238,7 +351,7 @@ impl Opts {
 
     /// TCP keep alive timeout in milliseconds (defaults to `None).
     pub fn get_tcp_keepalive(&self) -> Option<u32> {
-        self.inner.tcp_keepalive.clone()
+        self.inner.tcp_keepalive
     }
 
     /// Whether `TCP_NODELAY` will be set for mysql connection.
@@ -254,14 +367,14 @@ impl Opts {
             .map(|x| x.clone_inner())
     }
 
-    /// /// Bounds for the number of opened connections in `Pool` (defaults to `min: 10, max: 100`).
-    pub fn get_pool_constraints(&self) -> &PoolConstraints {
-        &self.inner.pool_constraints
+    /// Connection pool options (defaults to [`Default::default`]).
+    pub fn get_pool_options(&self) -> &PoolOptions {
+        &self.inner.pool_options
     }
 
-    /// Pool will close connection if time since last IO exceeds this value
+    /// Pool will close connection if time since last IO exceeds this number of seconds
     /// (defaults to `wait_timeout`).
-    pub fn get_conn_ttl(&self) -> Option<u32> {
+    pub fn get_conn_ttl(&self) -> Option<Duration> {
         self.inner.conn_ttl
     }
 
@@ -271,8 +384,6 @@ impl Opts {
     }
 
     /// Driver will require SSL connection if this option isn't `None` (default to `None`).
-    ///
-    /// This option requires `ssl` feature to work.
     pub fn get_ssl_opts(&self) -> Option<&SslOpts> {
         self.inner.ssl_opts.as_ref()
     }
@@ -302,6 +413,20 @@ impl Opts {
         self.inner.socket.as_ref().map(|x| &**x)
     }
 
+    /// If not `None`, then client will ask for compression if server supports it
+    /// (defaults to `None`).
+    ///
+    /// Can be defined using `compress` connection url parameter with values:
+    /// * `fast` - for compression level 1;
+    /// * `best` - for compression level 9;
+    /// * `on`, `true` - for default compression level;
+    /// * `0`, ..., `9`.
+    ///
+    /// Note that compression level defined here will affect only outgoing packets.
+    pub fn get_compression(&self) -> Option<crate::Compression> {
+        self.inner.compression
+    }
+
     pub(crate) fn get_capabilities(&self) -> CapabilityFlags {
         let mut out = CapabilityFlags::CLIENT_PROTOCOL_41
             | CapabilityFlags::CLIENT_SECURE_CONNECTION
@@ -320,6 +445,9 @@ impl Opts {
         if self.inner.ssl_opts.is_some() {
             out |= CapabilityFlags::CLIENT_SSL;
         }
+        if self.inner.compression.is_some() {
+            out |= CapabilityFlags::CLIENT_COMPRESS;
+        }
 
         out
     }
@@ -337,27 +465,30 @@ impl Default for InnerOpts {
             tcp_keepalive: None,
             tcp_nodelay: true,
             local_infile_handler: None,
-            pool_constraints: Default::default(),
+            pool_options: Default::default(),
             conn_ttl: None,
             stmt_cache_size: DEFAULT_STMT_CACHE_SIZE,
             ssl_opts: None,
             prefer_socket: true,
             socket: None,
+            compression: None,
         }
     }
 }
 
 /// Connection pool constraints.
 ///
-/// This type stores `min` and `max` constraints for `Pool` and ensures that `min <= max`.
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+/// This type stores `min` and `max` constraints for [`crate::Pool`] and ensures that `min <= max`.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct PoolConstraints {
     min: usize,
     max: usize,
 }
 
 impl PoolConstraints {
-    /// Creates new `PoolConstraints` if constraints are valid (`min <= max`).
+    /// Creates new [`PoolConstraints`] if constraints are valid (`min <= max`).
+    ///
+    /// `inactive_connection_ttl` will have the default value.
     pub fn new(min: usize, max: usize) -> Option<PoolConstraints> {
         if min <= max {
             Some(PoolConstraints { min, max })
@@ -390,7 +521,7 @@ impl From<PoolConstraints> for (usize, usize) {
     }
 }
 
-/// Provides a way to build [`Opts`](struct.Opts.html).
+/// Provides a way to build [`Opts`].
 ///
 /// ```ignore
 /// // You can create new default builder
@@ -480,16 +611,16 @@ impl OptsBuilder {
         self
     }
 
-    /// Pool constraints. (defaults to `min: 10, max: 100`).
-    pub fn pool_constraints(&mut self, pool_constraints: Option<PoolConstraints>) -> &mut Self {
-        self.opts.pool_constraints = pool_constraints.unwrap_or(DEFAULT_POOL_CONSTRAINTS);
+    /// Connection pool options (defaults to `PoolOptions::default()`).
+    pub fn pool_options<T: Into<Option<PoolOptions>>>(&mut self, pool_options: T) -> &mut Self {
+        self.opts.pool_options = pool_options.into().unwrap_or_default();
         self
     }
 
-    /// Pool will close connection if time since last IO exceeds this value
+    /// Pool will close connection if time since last IO exceeds this number of seconds
     /// (defaults to `wait_timeout`. `None` to reset to default).
-    pub fn conn_ttl<T: Into<u32>>(&mut self, conn_ttl: Option<T>) -> &mut Self {
-        self.opts.conn_ttl = conn_ttl.map(Into::into);
+    pub fn conn_ttl<T: Into<Option<Duration>>>(&mut self, conn_ttl: T) -> &mut Self {
+        self.opts.conn_ttl = conn_ttl.into();
         self
     }
 
@@ -505,8 +636,6 @@ impl OptsBuilder {
     }
 
     /// Driver will require SSL connection if this option isn't `None` (default to `None`).
-    ///
-    /// This option requires `ssl` feature to work.
     pub fn ssl_opts<T: Into<Option<SslOpts>>>(&mut self, ssl_opts: T) -> &mut Self {
         self.opts.ssl_opts = ssl_opts.into();
         self
@@ -531,6 +660,24 @@ impl OptsBuilder {
     /// Path to unix socket (or named pipe on Windows) (defaults to `None`).
     pub fn socket<T: Into<String>>(&mut self, socket: Option<T>) -> &mut Self {
         self.opts.socket = socket.map(Into::into);
+        self
+    }
+
+    /// If not `None`, then client will ask for compression if server supports it
+    /// (defaults to `None`).
+    ///
+    /// Can be defined using `compress` connection url parameter with values:
+    /// * `fast` - for compression level 1;
+    /// * `best` - for compression level 9;
+    /// * `on`, `true` - for default compression level;
+    /// * `0`, ..., `9`.
+    ///
+    /// Note that compression level defined here will affect only outgoing packets.
+    pub fn compression<T: Into<Option<crate::Compression>>>(
+        &mut self,
+        compression: T,
+    ) -> &mut Self {
+        self.opts.compression = compression.into();
         self
     }
 }
@@ -597,17 +744,17 @@ fn from_url_basic(
     let ip_or_hostname = url
         .host_str()
         .map(String::from)
-        .unwrap_or("127.0.0.1".into());
+        .unwrap_or_else(|| "127.0.0.1".into());
     let tcp_port = url.port().unwrap_or(3306);
     let db_name = get_opts_db_name_from_url(&url);
 
     let query_pairs = url.query_pairs().into_owned().collect();
     let opts = InnerOpts {
-        user: user,
-        pass: pass,
-        ip_or_hostname: ip_or_hostname,
-        tcp_port: tcp_port,
-        db_name: db_name,
+        user,
+        pass,
+        ip_or_hostname,
+        tcp_port,
+        db_name,
         ..InnerOpts::default()
     };
 
@@ -639,9 +786,33 @@ fn from_url(url: &str) -> std::result::Result<InnerOpts, UrlError> {
                     });
                 }
             }
+        } else if key == "inactive_connection_ttl" {
+            match u64::from_str(&*value) {
+                Ok(value) => opts
+                    .pool_options
+                    .set_inactive_connection_ttl(Duration::from_secs(value)),
+                _ => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: "inactive_connection_ttl".into(),
+                        value,
+                    });
+                }
+            }
+        } else if key == "ttl_check_interval" {
+            match u64::from_str(&*value) {
+                Ok(value) => opts
+                    .pool_options
+                    .set_ttl_check_interval(Duration::from_secs(value)),
+                _ => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: "ttl_check_interval".into(),
+                        value,
+                    });
+                }
+            }
         } else if key == "conn_ttl" {
             match u32::from_str(&*value) {
-                Ok(value) => opts.conn_ttl = Some(value),
+                Ok(value) => opts.conn_ttl = Some(Duration::from_secs(value as u64)),
                 _ => {
                     return Err(UrlError::InvalidParamValue {
                         param: "conn_ttl".into(),
@@ -695,13 +866,30 @@ fn from_url(url: &str) -> std::result::Result<InnerOpts, UrlError> {
             }
         } else if key == "socket" {
             opts.socket = Some(value)
+        } else if key == "compression" {
+            if value == "fast" {
+                opts.compression = Some(crate::Compression::fast());
+            } else if value == "on" || value == "true" {
+                opts.compression = Some(crate::Compression::default());
+            } else if value == "best" {
+                opts.compression = Some(crate::Compression::best());
+            } else if value.len() == 1 && 0x30 <= value.as_bytes()[0] && value.as_bytes()[0] <= 0x39
+            {
+                opts.compression =
+                    Some(crate::Compression::new((value.as_bytes()[0] - 0x30) as u32));
+            } else {
+                return Err(UrlError::InvalidParamValue {
+                    param: "compression".into(),
+                    value: value.to_string(),
+                });
+            }
         } else {
             return Err(UrlError::UnknownParameter { param: key });
         }
     }
 
     if let Some(pool_constraints) = PoolConstraints::new(pool_min, pool_max) {
-        opts.pool_constraints = pool_constraints;
+        opts.pool_options.set_constraints(pool_constraints);
     } else {
         return Err(UrlError::InvalidPoolConstraints {
             min: pool_min,
@@ -729,6 +917,7 @@ impl<T: AsRef<str> + Sized> From<T> for Opts {
 #[cfg(test)]
 mod test {
     use super::{from_url, InnerOpts, Opts};
+    use crate::error::UrlError::InvalidParamValue;
 
     #[test]
     fn should_convert_url_into_opts() {
@@ -765,5 +954,44 @@ mod test {
     fn should_panic_on_unknown_query_param() {
         let opts = "mysql://localhost/foo?bar=baz";
         let _: Opts = opts.into();
+    }
+
+    #[test]
+    fn should_parse_compression() {
+        let err = Opts::from_url("mysql://localhost/foo?compression=").unwrap_err();
+        assert_eq!(
+            err,
+            InvalidParamValue {
+                param: "compression".into(),
+                value: "".into()
+            }
+        );
+
+        let err = Opts::from_url("mysql://localhost/foo?compression=a").unwrap_err();
+        assert_eq!(
+            err,
+            InvalidParamValue {
+                param: "compression".into(),
+                value: "a".into()
+            }
+        );
+
+        let opts = Opts::from_url("mysql://localhost/foo?compression=fast").unwrap();
+        assert_eq!(opts.get_compression(), Some(crate::Compression::fast()));
+
+        let opts = Opts::from_url("mysql://localhost/foo?compression=on").unwrap();
+        assert_eq!(opts.get_compression(), Some(crate::Compression::default()));
+
+        let opts = Opts::from_url("mysql://localhost/foo?compression=true").unwrap();
+        assert_eq!(opts.get_compression(), Some(crate::Compression::default()));
+
+        let opts = Opts::from_url("mysql://localhost/foo?compression=best").unwrap();
+        assert_eq!(opts.get_compression(), Some(crate::Compression::best()));
+
+        let opts = Opts::from_url("mysql://localhost/foo?compression=0").unwrap();
+        assert_eq!(opts.get_compression(), Some(crate::Compression::new(0)));
+
+        let opts = Opts::from_url("mysql://localhost/foo?compression=9").unwrap();
+        assert_eq!(opts.get_compression(), Some(crate::Compression::new(9)));
     }
 }

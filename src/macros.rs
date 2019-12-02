@@ -8,27 +8,7 @@
 
 macro_rules! const_assert {
     ($name:ident, $($xs:expr),+ $(,)*) => {
-        #[allow(unknown_lints, eq_op)]
+        #[allow(unknown_lints, clippy::eq_op)]
         const $name: [(); 0 - !($($xs)&&+) as usize] = [];
     };
-}
-
-macro_rules! steps {
-    ($fut:ty { $($step:ident($ty:ty),)+ }) => (
-        enum Step {
-            $($step($ty),)+
-        }
-
-        enum Out {
-            $($step(<$ty as Future>::Item),)+
-        }
-
-        impl $fut {
-            fn either_poll(&mut self) -> Result<Async<Out>> {
-                match self.step {
-                    $(Step::$step(ref mut fut) => Ok(Ready(Out::$step(::futures::try_ready!(fut.poll())))),)+
-                }
-            }
-        }
-    );
 }

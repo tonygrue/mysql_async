@@ -6,40 +6,42 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use futures::{
-    Async::{NotReady, Ready},
-    Future, Poll,
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use crate::{
+    conn::pool::{Inner, Pool},
+    error::Error,
 };
 
-use crate::{conn::pool::Pool, error::*};
+use std::sync::{atomic, Arc};
 
 /// Future that disconnects this pool from server and resolves to `()`.
 ///
 /// Active connections taken from this pool should be disconnected manually.
 /// Also all pending and new `GetConn`'s will resolve to error.
 pub struct DisconnectPool {
-    pool: Pool,
+    pool_inner: Arc<Inner>,
 }
 
 pub fn new(pool: Pool) -> DisconnectPool {
-    DisconnectPool { pool: pool }
+    DisconnectPool {
+        pool_inner: pool.inner,
+    }
 }
 
 impl Future for DisconnectPool {
-    type Item = ();
-    type Error = Error;
+    type Output = Result<(), Error>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.pool.handle_futures()?;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.pool_inner.clone().spawn_futures_if_needed();
+        self.pool_inner.wake.push(cx.waker().clone());
 
-        let (new_len, queue_len) = self
-            .pool
-            .with_inner(|inner| (inner.new.len(), inner.queue.len()));
-
-        if (new_len, queue_len) == (0, 0) {
-            Ok(Ready(()))
+        if self.pool_inner.closed.load(atomic::Ordering::Acquire) {
+            Poll::Ready(Ok(()))
         } else {
-            Ok(NotReady)
+            Poll::Pending
         }
     }
 }

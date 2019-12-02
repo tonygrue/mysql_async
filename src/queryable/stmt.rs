@@ -6,29 +6,21 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use bit_vec::BitVec;
-use byteorder::{LittleEndian as LE, ReadBytesExt, WriteBytesExt};
-use futures::future::{
-    err, loop_fn, ok,
-    Either::{self, *},
-    Future, IntoFuture, Loop,
-};
-use mysql_common::value::serialize_bin_many;
-
-use std::io::Write;
+use futures_util::future::Either;
 
 use crate::{
     connection_like::{
         streamless::Streamless, ConnectionLike, ConnectionLikeWrapper, StmtCacheResult,
     },
-    consts::{ColumnType, Command},
     error::*,
     io,
     prelude::FromRow,
     queryable::{query_result::QueryResult, BinaryProtocol},
-    Column, MyFuture, Params, Row,
-    Value::{self, *},
+    Column, Params, Row,
+    Value::{self},
 };
+use mysql_common::constants::MAX_PAYLOAD_LEN;
+use mysql_common::packets::{parse_stmt_packet, ComStmtExecuteRequestBuilder, ComStmtSendLongData};
 
 /// Inner statement representation.
 #[derive(Eq, PartialEq, Clone, Debug)]
@@ -45,18 +37,15 @@ pub struct InnerStmt {
 
 impl InnerStmt {
     // TODO: Consume payload?
-    pub fn new(pld: &[u8], named_params: Option<Vec<String>>) -> Result<InnerStmt> {
-        let mut reader = &pld[1..];
-        let statement_id = reader.read_u32::<LE>()?;
-        let num_columns = reader.read_u16::<LE>()?;
-        let num_params = reader.read_u16::<LE>()?;
-        let warning_count = reader.read_u16::<LE>()?;
+    pub fn new(payload: &[u8], named_params: Option<Vec<String>>) -> Result<InnerStmt> {
+        let packet = parse_stmt_packet(payload)?;
+
         Ok(InnerStmt {
-            named_params: named_params,
-            statement_id: statement_id,
-            num_columns: num_columns,
-            num_params: num_params,
-            warning_count: warning_count,
+            named_params,
+            statement_id: packet.statement_id(),
+            num_columns: packet.num_columns(),
+            num_params: packet.num_params(),
+            warning_count: packet.warning_count(),
             params: None,
             columns: None,
         })
@@ -64,6 +53,7 @@ impl InnerStmt {
 }
 
 /// Prepared statement
+#[derive(Debug)]
 pub struct Stmt<T> {
     conn_like: Option<Either<T, Streamless<T>>>,
     inner: InnerStmt,
@@ -86,217 +76,153 @@ where
 {
     fn new(conn_like: T, inner: InnerStmt, cached: StmtCacheResult) -> Stmt<T> {
         Stmt {
-            conn_like: Some(A(conn_like)),
+            conn_like: Some(Either::Left(conn_like)),
             inner,
             cached: Some(cached),
         }
     }
 
-    fn send_long_data_for_index(
-        self,
-        params: Vec<Value>,
-        index: usize,
-    ) -> impl MyFuture<(Self, Vec<Value>)> {
-        loop_fn((self, params, index, 0), |(this, params, index, chunk)| {
-            let data_cap = crate::consts::MAX_PAYLOAD_LEN - 10;
-            let buf = match params[index] {
-                Bytes(ref x) => {
-                    let statement_id = this.inner.statement_id;
-                    let mut chunks = x.chunks(data_cap);
-                    match chunks.nth(chunk) {
-                        Some(chunk) => {
-                            let mut buf = Vec::with_capacity(chunk.len() + 6);
-                            buf.write_u32::<LE>(statement_id).unwrap();
-                            buf.write_u16::<LE>(index as u16).unwrap();
-                            buf.write_all(chunk).unwrap();
-                            Some(buf)
-                        }
-                        _ => None,
-                    }
+    async fn send_long_data(self, params: Vec<Value>) -> Result<Self> {
+        let mut this = self;
+
+        for (i, value) in params.into_iter().enumerate() {
+            if let Value::Bytes(bytes) = value {
+                let chunks = bytes.chunks(MAX_PAYLOAD_LEN - 6);
+                let chunks = chunks.chain(if bytes.is_empty() {
+                    Some(&[][..])
+                } else {
+                    None
+                });
+                for chunk in chunks {
+                    let com = ComStmtSendLongData::new(this.inner.statement_id, i, chunk);
+                    this = this.write_command_raw(com.into()).await?;
                 }
-                _ => unreachable!(),
-            };
-            match buf {
-                Some(buf) => {
-                    let chunk_len = buf.len() - 6;
-                    let fut = this
-                        .write_command_data(Command::COM_STMT_SEND_LONG_DATA, buf)
-                        .map(move |this| {
-                            if chunk_len < data_cap {
-                                Loop::Break((this, params))
-                            } else {
-                                Loop::Continue((this, params, index, chunk + 1))
-                            }
-                        });
-                    A(fut)
-                }
-                None => B(ok(Loop::Break((this, params)))),
             }
-        })
+        }
+
+        Ok(this)
     }
 
-    fn send_long_data(
-        self,
-        params: Vec<Value>,
-        large_bitmap: BitVec<u8>,
-    ) -> impl MyFuture<(Self, Vec<Value>)> {
-        let bits = large_bitmap.into_iter().enumerate();
-
-        loop_fn(
-            (self, params, bits),
-            |(this, params, mut bits)| match bits.next() {
-                Some((index, true)) => A(this
-                    .send_long_data_for_index(params, index)
-                    .map(|(this, params)| Loop::Continue((this, params, bits)))),
-                Some((_, false)) => B(ok(Loop::Continue((this, params, bits)))),
-                None => B(ok(Loop::Break((this, params)))),
-            },
-        )
-    }
-
-    fn execute_positional<U>(self, params: U) -> impl MyFuture<QueryResult<Self, BinaryProtocol>>
+    async fn execute_positional<U>(self, params: U) -> Result<QueryResult<Self, BinaryProtocol>>
     where
         U: ::std::ops::Deref<Target = [Value]>,
         U: IntoIterator<Item = Value>,
         U: Send + 'static,
     {
         if self.inner.num_params as usize != params.len() {
-            let error = DriverError::StmtParamsMismatch {
+            Err(DriverError::StmtParamsMismatch {
                 required: self.inner.num_params,
                 supplied: params.len() as u16,
-            }
-            .into();
-            return A(err(error));
+            })?
         }
 
-        let fut = self
-            .inner
-            .params
-            .as_ref()
-            .ok_or_else(|| unreachable!())
-            .and_then(|params_def| serialize_bin_many(&*params_def, &*params).map_err(Error::from))
-            .into_future()
-            .and_then(|bin_payload| match bin_payload {
-                (row_data, null_bitmap, large_bitmap) => self
-                    .send_long_data(params.into_iter().collect(), large_bitmap.clone())
-                    .and_then(|(this, params)| {
-                        let mut data = Vec::new();
-                        write_data(
-                            &mut data,
-                            this.inner.statement_id,
-                            row_data,
-                            params,
-                            this.inner.params.as_ref().unwrap(),
-                            null_bitmap,
-                        );
-                        this.write_command_data(Command::COM_STMT_EXECUTE, data)
-                    }),
-            })
-            .and_then(|this| this.read_result_set(None));
-        B(fut)
+        let params = params.into_iter().collect::<Vec<_>>();
+
+        let (body, as_long_data) =
+            ComStmtExecuteRequestBuilder::new(self.inner.statement_id).build(&*params);
+
+        let this = if as_long_data {
+            self.send_long_data(params).await?
+        } else {
+            self
+        };
+
+        this.write_command_raw(body)
+            .await?
+            .read_result_set(None)
+            .await
     }
 
-    fn execute_named(self, params: Params) -> impl MyFuture<QueryResult<Self, BinaryProtocol>> {
+    async fn execute_named(self, params: Params) -> Result<QueryResult<Self, BinaryProtocol>> {
         if self.inner.named_params.is_none() {
             let error = DriverError::NamedParamsForPositionalQuery.into();
-            return A(err(error));
+            return Err(error);
         }
 
         let positional_params =
             match params.into_positional(self.inner.named_params.as_ref().unwrap()) {
                 Ok(positional_params) => positional_params,
-                Err(error) => {
-                    return A(err(error.into()));
-                }
+                Err(error) => return Err(error.into()),
             };
 
         match positional_params {
-            Params::Positional(params) => B(self.execute_positional(params)),
+            Params::Positional(params) => self.execute_positional(params).await,
             _ => unreachable!(),
         }
     }
 
-    fn execute_empty(self) -> impl MyFuture<QueryResult<Self, BinaryProtocol>> {
+    async fn execute_empty(self) -> Result<QueryResult<Self, BinaryProtocol>> {
         if self.inner.num_params > 0 {
             let error = DriverError::StmtParamsMismatch {
                 required: self.inner.num_params,
                 supplied: 0,
             }
             .into();
-            return A(err(error));
+            return Err(error);
         }
 
-        let mut data = Vec::with_capacity(4 + 1 + 4);
-        data.write_u32::<LE>(self.inner.statement_id).unwrap();
-        data.write_u8(0u8).unwrap();
-        data.write_u32::<LE>(1u32).unwrap();
-
-        B(self
-            .write_command_data(Command::COM_STMT_EXECUTE, data)
-            .and_then(|this| this.read_result_set(None)))
+        let (body, _) = ComStmtExecuteRequestBuilder::new(self.inner.statement_id).build(&[]);
+        let this = self.write_command_raw(body).await?;
+        this.read_result_set(None).await
     }
 
     /// See `Queryable::execute`
-    pub fn execute<P>(self, params: P) -> impl MyFuture<QueryResult<Self, BinaryProtocol>>
+    pub async fn execute<P>(self, params: P) -> Result<QueryResult<Self, BinaryProtocol>>
     where
         P: Into<Params>,
     {
         let params = params.into();
         match params {
-            Params::Positional(params) => return A(self.execute_positional(params)),
-            Params::Named(_) => return B(A(self.execute_named(params))),
-            Params::Empty => return B(B(self.execute_empty())),
+            Params::Positional(params) => self.execute_positional(params).await,
+            Params::Named(_) => self.execute_named(params).await,
+            Params::Empty => self.execute_empty().await,
         }
     }
 
     /// See `Queryable::first`
-    pub fn first<P, R>(self, params: P) -> impl MyFuture<(Self, Option<R>)>
+    pub async fn first<P, R>(self, params: P) -> Result<(Self, Option<R>)>
     where
         P: Into<Params> + 'static,
         R: FromRow,
     {
-        self.execute(params)
-            .and_then(|result| result.collect_and_drop::<Row>())
-            .map(|(this, mut rows)| {
-                if rows.len() > 1 {
-                    (this, Some(FromRow::from_row(rows.swap_remove(0))))
-                } else {
-                    (this, rows.pop().map(FromRow::from_row))
-                }
-            })
+        let result = self.execute(params).await?;
+        let (this, mut rows) = result.collect_and_drop::<Row>().await?;
+        if rows.len() > 1 {
+            Ok((this, Some(FromRow::from_row(rows.swap_remove(0)))))
+        } else {
+            Ok((this, rows.pop().map(FromRow::from_row)))
+        }
     }
 
     /// See `Queryable::batch`
-    pub fn batch<I, P>(self, params_iter: I) -> impl MyFuture<Self>
+    pub async fn batch<I, P>(self, params_iter: I) -> Result<Self>
     where
         I: IntoIterator<Item = P>,
         I::IntoIter: Send + 'static,
         Params: From<P>,
         P: 'static,
     {
-        let params_iter = params_iter.into_iter().map(Params::from);
-
-        loop_fn(
-            (self, params_iter),
-            |(this, mut params_iter)| match params_iter.next() {
-                Some(params) => A(this
-                    .execute(params)
-                    .and_then(|result| result.drop_result())
-                    .map(|this| Loop::Continue((this, params_iter)))),
-                None => B(ok(Loop::Break(this))),
-            },
-        )
+        let mut params_iter = params_iter.into_iter().map(Params::from);
+        let mut this = self;
+        loop {
+            match params_iter.next() {
+                Some(params) => {
+                    this = this.execute(params).await?.drop_result().await?;
+                }
+                None => break Ok(this),
+            }
+        }
     }
 
     /// This will close statement (if it's not in the cache) and resolve to a wrapped queryable.
-    pub fn close(mut self) -> impl MyFuture<T> {
+    pub async fn close(mut self) -> Result<T> {
         let cached = self.cached.take();
         match self.conn_like {
-            Some(A(conn_like)) => {
+            Some(Either::Left(conn_like)) => {
                 if let Some(StmtCacheResult::NotCached(stmt_id)) = cached {
-                    A(conn_like.close_stmt(stmt_id))
+                    conn_like.close_stmt(stmt_id).await
                 } else {
-                    B(ok(conn_like))
+                    Ok(conn_like)
                 }
             }
             _ => unreachable!(),
@@ -305,7 +231,7 @@ where
 
     pub(crate) fn unwrap(mut self) -> (T, Option<StmtCacheResult>) {
         match self.conn_like {
-            Some(A(conn_like)) => (conn_like, self.cached.take()),
+            Some(Either::Left(conn_like)) => (conn_like, self.cached.take()),
             _ => unreachable!(),
         }
     }
@@ -324,10 +250,10 @@ impl<T: ConnectionLike + 'static> ConnectionLikeWrapper for Stmt<T> {
             cached,
         } = self;
         match conn_like {
-            Some(A(conn_like)) => {
+            Some(Either::Left(conn_like)) => {
                 let (streamless, stream) = conn_like.take_stream();
                 let this = Stmt {
-                    conn_like: Some(B(streamless)),
+                    conn_like: Some(Either::Right(streamless)),
                     inner,
                     cached,
                 };
@@ -340,8 +266,8 @@ impl<T: ConnectionLike + 'static> ConnectionLikeWrapper for Stmt<T> {
     fn return_stream(&mut self, stream: io::Stream) {
         let conn_like = self.conn_like.take().unwrap();
         match conn_like {
-            B(streamless) => {
-                self.conn_like = Some(A(streamless.return_stream(stream)));
+            Either::Right(streamless) => {
+                self.conn_like = Some(Either::Left(streamless.return_stream(stream)));
             }
             _ => unreachable!(),
         }
@@ -349,45 +275,15 @@ impl<T: ConnectionLike + 'static> ConnectionLikeWrapper for Stmt<T> {
 
     fn conn_like_ref(&self) -> &Self::ConnLike {
         match self.conn_like {
-            Some(A(ref conn_like)) => conn_like,
+            Some(Either::Left(ref conn_like)) => conn_like,
             _ => unreachable!(),
         }
     }
 
     fn conn_like_mut(&mut self) -> &mut Self::ConnLike {
         match self.conn_like {
-            Some(A(ref mut conn_like)) => conn_like,
+            Some(Either::Left(ref mut conn_like)) => conn_like,
             _ => unreachable!(),
         }
     }
-}
-
-fn write_data(
-    writer: &mut Vec<u8>,
-    stmt_id: u32,
-    row_data: Vec<u8>,
-    params: Vec<Value>,
-    params_def: &Vec<Column>,
-    null_bitmap: BitVec<u8>,
-) {
-    let capacity = 9 + null_bitmap.storage().len() + 1 + params.len() * 2 + row_data.len();
-    writer.reserve(capacity);
-    writer.write_u32::<LE>(stmt_id).unwrap();
-    writer.write_u8(0u8).unwrap();
-    writer.write_u32::<LE>(1u32).unwrap();
-    writer.write_all(null_bitmap.storage().as_ref()).unwrap();
-    writer.write_u8(1u8).unwrap();
-    for i in 0..params.len() {
-        let result = match params[i] {
-            NULL => writer.write_all(&[params_def[i].column_type() as u8, 0u8]),
-            Bytes(..) => writer.write_all(&[ColumnType::MYSQL_TYPE_VAR_STRING as u8, 0u8]),
-            Int(..) => writer.write_all(&[ColumnType::MYSQL_TYPE_LONGLONG as u8, 0u8]),
-            UInt(..) => writer.write_all(&[ColumnType::MYSQL_TYPE_LONGLONG as u8, 128u8]),
-            Float(..) => writer.write_all(&[ColumnType::MYSQL_TYPE_DOUBLE as u8, 0u8]),
-            Date(..) => writer.write_all(&[ColumnType::MYSQL_TYPE_DATETIME as u8, 0u8]),
-            Time(..) => writer.write_all(&[ColumnType::MYSQL_TYPE_TIME as u8, 0u8]),
-        };
-        result.unwrap();
-    }
-    writer.write_all(row_data.as_ref()).unwrap();
 }

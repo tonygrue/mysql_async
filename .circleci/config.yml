@@ -8,10 +8,7 @@ jobs:
         type: string
       flavor:
         type: string
-      test-ssl:
-        type: boolean
-        default: false
-      test-unstable:
+      test-all:
         type: boolean
         default: false
     docker:
@@ -34,30 +31,32 @@ jobs:
             - /usr/local/cargo/registry/index
       - restore_cache:
           key: deps-<< parameters.rust >>-{{ checksum "Cargo.lock" }}
-      - run: cargo test
-      - when:
-          condition: << parameters.test-ssl >>
-          steps:
-            - run: cargo test --features ssl
       - run: rustup component add rustfmt
       - run: cargo fmt -- --check
+      - run: cargo test
       - save_cache:
           key: deps-<< parameters.rust >>-{{ checksum "Cargo.lock" }}
           paths:
             - /usr/local/cargo/registry/cache
       - when:
-          condition: << parameters.test-unstable >>
+          condition: << parameters.test-all >>
           steps:
+            - run:
+                name: Nightly
+                command: |
+                  rustup toolchain install nightly
+                  cargo +nightly test
             - run:
                 name: Beta
                 command: |
                   rustup toolchain install beta
                   cargo +beta test
             - run:
-                name: Nightly
-                command: |
-                  rustup toolchain install nightly
-                  cargo +nightly test
+                name: Stable + SSL + COMPRESS
+                command: cargo test
+                environment:
+                  SSL: 1
+                  COMPRESS: 1
 
 
 workflows:
@@ -73,14 +72,12 @@ workflows:
           rust: latest
           flavor: mysql
           version: "5.7"
-          test-ssl: true
       - linux:
           name: stable-mysql-8.0
           rust: latest
           flavor: mysql
           version: "8.0"
-          test-ssl: true
-          test-unstable: true
+          test-all: true
       - linux:
           name: stable-mariadb-5.5
           rust: latest
